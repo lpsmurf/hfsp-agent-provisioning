@@ -16,10 +16,11 @@ RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
 # Install OpenClaw pinned
 RUN npm i -g openclaw@${OPENCLAW_VERSION}
 
-# Runtime user
-RUN useradd -m -u 10001 -s /bin/bash hfsp \
+# Runtime user + workspace dir (must be created as root before USER switch)
+RUN useradd -m -u 1002 -s /bin/bash hfsp \
   && mkdir -p /home/hfsp/.openclaw/secrets \
-  && chown -R hfsp:hfsp /home/hfsp
+  && mkdir -p /tenant/workspace \
+  && chown -R hfsp:hfsp /home/hfsp /tenant
 
 WORKDIR /home/hfsp
 

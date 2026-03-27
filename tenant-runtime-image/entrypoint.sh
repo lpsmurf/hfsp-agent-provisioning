@@ -2,37 +2,49 @@
 set -euo pipefail
 
 # Tenant runtime entrypoint
-# - openclaw.json is bind-mounted read-only to: /home/hfsp/.openclaw/openclaw.json
-# - secrets dir is bind-mounted read-only to: /home/hfsp/.openclaw/secrets
-# - workspace is bind-mounted to: /tenant/workspace
+# Mounts:
+#   /run/openclaw/openclaw.json  (ro) — config staging path
+#   /home/hfsp/.openclaw/secrets/ (ro) — secrets dir
 #
-# IMPORTANT: Do not create symlinks in /home/hfsp/.openclaw when mounts are read-only.
+# OpenClaw rewrites ~/.openclaw/openclaw.json on startup.
+# We mount config to /run/openclaw/ and copy it into the writable
+# ~/.openclaw/ dir before starting the gateway.
 
-mkdir -p /tenant/workspace
+export HOME=/home/hfsp
 
-# Resolve provider keys from mounted secrets.
-# IMPORTANT: `su` typically clears env vars, so we pass them inline to the command.
-ANTHROPIC_KEY="${ANTHROPIC_API_KEY:-}"
-if [[ -z "$ANTHROPIC_KEY" ]] && [[ -f /home/hfsp/.openclaw/secrets/anthropic.key ]]; then
-  ANTHROPIC_KEY="$(tr -d '\r\n' < /home/hfsp/.openclaw/secrets/anthropic.key)"
+SECRETS=/home/hfsp/.openclaw/secrets
+
+# Copy config from staging mount into writable home dir
+mkdir -p /home/hfsp/.openclaw
+cp /run/openclaw/openclaw.json /home/hfsp/.openclaw/openclaw.json
+
+# SSH credentials required by openclaw.json sandbox.ssh config
+if [[ -f "$SECRETS/ssh_identity" ]]; then
+  export SSH_IDENTITY="$(cat "$SECRETS/ssh_identity")"
+else
+  echo "[entrypoint] ERROR: $SECRETS/ssh_identity not found" >&2
+  exit 1
 fi
 
-OPENAI_KEY="${OPENAI_API_KEY:-}"
-if [[ -z "$OPENAI_KEY" ]] && [[ -f /home/hfsp/.openclaw/secrets/openai.key ]]; then
-  OPENAI_KEY="$(tr -d '\r\n' < /home/hfsp/.openclaw/secrets/openai.key)"
+if [[ -f "$SECRETS/ssh_known_hosts" ]]; then
+  export SSH_KNOWN_HOSTS="$(cat "$SECRETS/ssh_known_hosts")"
+else
+  echo "[entrypoint] ERROR: $SECRETS/ssh_known_hosts not found" >&2
+  exit 1
 fi
 
-# Drop privileges and run gateway
-# IMPORTANT:
-# - Do NOT use `su -m` here, because it preserves HOME=/root and OpenClaw then
-#   looks for /root/.openclaw/openclaw.json ("Missing config" + default port 18789).
-# - Instead, pass HOME + keys inline.
-CMD_PREFIX="HOME=/home/hfsp"
-if [[ -n "$ANTHROPIC_KEY" ]]; then
-  CMD_PREFIX+=" ANTHROPIC_API_KEY=\"$ANTHROPIC_KEY\""
-fi
-if [[ -n "$OPENAI_KEY" ]]; then
-  CMD_PREFIX+=" OPENAI_API_KEY=\"$OPENAI_KEY\""
+# Optional provider API keys
+if [[ -z "${ANTHROPIC_API_KEY:-}" ]] && [[ -f "$SECRETS/anthropic.key" ]]; then
+  export ANTHROPIC_API_KEY="$(tr -d "\r\n" < "$SECRETS/anthropic.key")"
 fi
 
-exec su -s /bin/bash -c "$CMD_PREFIX openclaw gateway run --force --allow-unconfigured --bind loopback --port 18789" hfsp
+if [[ -z "${OPENAI_API_KEY:-}" ]] && [[ -f "$SECRETS/openai.key" ]]; then
+  export OPENAI_API_KEY="$(tr -d "\r\n" < "$SECRETS/openai.key")"
+fi
+
+exec openclaw gateway run \
+  --force \
+  --allow-unconfigured \
+  --bind loopback \
+  --port 18789 \
+  --verbose
