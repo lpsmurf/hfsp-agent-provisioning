@@ -16,7 +16,6 @@ async function main() {
       TEST_MODE: '1',
     },
     healthCheckCmd: 'HOME=/home/hfsp openclaw channels status --probe',
-    healthCheckUser: 'hfsp',
   });
 
   console.log(JSON.stringify(result, null, 2));
