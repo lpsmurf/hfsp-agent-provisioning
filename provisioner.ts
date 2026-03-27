@@ -66,6 +66,7 @@ export class ShellProvisioner implements Provisioner {
         ...buildEnvArgs(config.env),
         `-v ${shEscape(config.workspacePath)}:/tenant/workspace`,
         `-v ${shEscape(config.secretsPath)}:/home/clawd/.openclaw/secrets:ro`,
+        `-v ${shEscape('/home/clawd/.openclaw/openclaw.json')}:/home/clawd/.openclaw/openclaw.json:ro`,
         shEscape(config.image),
       ].join(' ');
 
