@@ -35,4 +35,4 @@ if [[ -n "$OPENAI_KEY" ]]; then
   CMD_PREFIX+=" OPENAI_API_KEY=\"$OPENAI_KEY\""
 fi
 
-exec su -s /bin/bash -c "$CMD_PREFIX openclaw gateway run --force" hfsp
+exec su -s /bin/bash -c "$CMD_PREFIX openclaw gateway run --force --allow-unconfigured --bind loopback --port 18789" hfsp
