@@ -9,6 +9,7 @@ export interface ProvisionConfig {
   secretsPath: string;
   env: Record<string, string>;
   healthCheckCmd?: string;
+  healthCheckUser?: string;
   portMappings?: Array<{ hostPort: number; containerPort: number }>;
 }
 
@@ -78,7 +79,7 @@ export class ShellProvisioner implements Provisioner {
         throw new Error('Container did not reach running state');
       }
 
-      const healthPassed = await this.runHealthCheck(name, config.healthCheckCmd);
+      const healthPassed = await this.runHealthCheck(name, config.healthCheckCmd, config.healthCheckUser);
       if (!healthPassed) {
         throw new Error('Health check failed');
       }
@@ -167,9 +168,15 @@ export class ShellProvisioner implements Provisioner {
     return false;
   }
 
-  private async runHealthCheck(containerName: string, healthCheckCmd?: string): Promise<boolean> {
-    const cmd = healthCheckCmd ?? 'HOME=/home/clawd openclaw channels status --probe';
-    const out = await this.exec(`docker exec -u clawd ${shEscape(containerName)} bash -lc ${shEscape(cmd)}`);
+  private async runHealthCheck(
+    containerName: string,
+    healthCheckCmd?: string,
+    healthCheckUser: string = 'hfsp'
+  ): Promise<boolean> {
+    const cmd = healthCheckCmd ?? `HOME=/home/${healthCheckUser} openclaw channels status --probe`;
+    const out = await this.exec(
+      `docker exec -u ${shEscape(healthCheckUser)} ${shEscape(containerName)} bash -lc ${shEscape(cmd)}`
+    );
     return /healthy|works|running|Gateway reachable/i.test(out) || out.trim().length > 0;
   }
 
