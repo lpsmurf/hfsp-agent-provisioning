@@ -26,4 +26,6 @@ WORKDIR /home/hfsp
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
+USER hfsp
+
 ENTRYPOINT ["/usr/bin/tini","--","/entrypoint.sh"]
