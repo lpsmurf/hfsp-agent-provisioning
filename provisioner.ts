@@ -108,7 +108,8 @@ export class ShellProvisioner implements Provisioner {
 
   async stop(tenantId: string): Promise<{ ok: boolean; error?: string }> {
     try {
-      await this.exec(`docker stop ${shEscape(this.containerNameFor(tenantId))} >/dev/null 2>&1 || true`);
+      const containerName = this.containerNameFor(tenantId);
+      await this.exec(`docker stop ${shEscape(containerName)} >/dev/null 2>&1 || true`);
       return { ok: true };
     } catch (err) {
       return { ok: false, error: err instanceof Error ? err.message : String(err) };
@@ -117,7 +118,8 @@ export class ShellProvisioner implements Provisioner {
 
   async remove(tenantId: string): Promise<{ ok: boolean; error?: string }> {
     try {
-      await this.exec(`docker rm -f ${shEscape(this.containerNameFor(tenantId))} >/dev/null 2>&1 || true`);
+      const containerName = this.containerNameFor(tenantId);
+      await this.exec(`docker rm -f ${shEscape(containerName)} >/dev/null 2>&1 || true`);
       return { ok: true };
     } catch (err) {
       return { ok: false, error: err instanceof Error ? err.message : String(err) };
