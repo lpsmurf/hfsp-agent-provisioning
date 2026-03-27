@@ -12,10 +12,11 @@ async function main() {
     workspacePath: '/tmp/hfsp-workspace',
     secretsPath: '/tmp/hfsp-secrets',
     env: {
-      HOME: '/home/clawd',
+      HOME: '/home/hfsp',
       TEST_MODE: '1',
     },
-    healthCheckCmd: 'HOME=/home/clawd openclaw channels status --probe',
+    healthCheckCmd: 'HOME=/home/hfsp openclaw channels status --probe',
+    healthCheckUser: 'hfsp',
   });
 
   console.log(JSON.stringify(result, null, 2));

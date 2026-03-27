@@ -14,7 +14,7 @@ This document captures the build and runtime contract for the OpenClaw tenant ru
 ## Resulting image behavior
 The image is expected to:
 - install the pinned OpenClaw CLI version
-- run under a non-root user (`clawd`)
+- run under a non-root user (`hfsp`)
 - mount tenant workspace and secret directories at runtime
 - start the OpenClaw gateway through the entrypoint script
 
@@ -23,13 +23,13 @@ The image is expected to:
 - Entry command: OpenClaw gateway run with forced mode
 
 ## Required runtime environment
-- `HOME=/home/clawd`
+- `HOME=/home/hfsp`
 - `ANTHROPIC_API_KEY` optional if provided via env or mounted secret file
 - `OPENAI_API_KEY` optional if provided via env or mounted secret file
 
 ## Mounted paths expected at runtime
-- `/home/clawd/.openclaw/openclaw.json` — read-only bind mount
-- `/home/clawd/.openclaw/secrets` — read-only bind mount
+- `/home/hfsp/.openclaw/openclaw.json` — read-only bind mount
+- `/home/hfsp/.openclaw/secrets` — read-only bind mount
 - `/tenant/workspace` — tenant workspace bind mount
 
 ## Lifecycle contract

@@ -17,11 +17,11 @@ RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
 RUN npm i -g openclaw@${OPENCLAW_VERSION}
 
 # Runtime user
-RUN useradd -m -u 10001 -s /bin/bash clawd \
-  && mkdir -p /home/clawd/.openclaw/secrets \
-  && chown -R clawd:clawd /home/clawd
+RUN useradd -m -u 10001 -s /bin/bash hfsp \
+  && mkdir -p /home/hfsp/.openclaw/secrets \
+  && chown -R hfsp:hfsp /home/hfsp
 
-WORKDIR /home/clawd
+WORKDIR /home/hfsp
 
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
