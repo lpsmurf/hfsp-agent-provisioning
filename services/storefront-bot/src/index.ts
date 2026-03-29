@@ -1,4 +1,7 @@
 import express from 'express';
+import { ShellProvisioner } from '../../../src/provisioner';
+import { PortRegistry } from '../../../src/port-registry';
+import { NginxManager } from '../../../src/nginx-manager';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
@@ -7,14 +10,14 @@ import crypto from 'node:crypto';
 import Database from 'better-sqlite3';
 
 const PORT = Number(process.env.PORT ?? 3000);
-const TOKEN_FILE = process.env.TELEGRAM_BOT_TOKEN_FILE ?? '/home/clawd/.openclaw/secrets/hfsp_agent_bot.token';
+const TOKEN_FILE = process.env.TELEGRAM_BOT_TOKEN_FILE ?? '/home/hfsp/.openclaw/secrets/hfsp_agent_bot.token';
 const DB_PATH = process.env.DB_PATH ?? path.join(process.cwd(), 'data', 'storefront.sqlite');
 
 // DB encryption (beta)
 // Single server-side master key.
 // Prefer env HFSP_DB_SECRET, else read from HFSP_DB_SECRET_FILE.
 // DO NOT commit the secret.
-const HFSP_DB_SECRET_FILE = process.env.HFSP_DB_SECRET_FILE ?? '/home/clawd/.openclaw/secrets/hfsp_db_secret';
+const HFSP_DB_SECRET_FILE = process.env.HFSP_DB_SECRET_FILE ?? '/home/hfsp/.openclaw/secrets/hfsp_db_secret';
 function loadDbSecret(): string {
   const env = process.env.HFSP_DB_SECRET?.trim();
   if (env && env.length >= 16) return env;
@@ -119,13 +122,12 @@ function unprotectTenantRowTokens(row: any): any {
   return r;
 }
 
-// Tenant VPS provisioning (private-only)
-const TENANT_VPS_HOST = process.env.TENANT_VPS_HOST ?? '187.124.173.69';
-const TENANT_VPS_USER = process.env.TENANT_VPS_USER ?? 'root';
-const TENANT_VPS_SSH_KEY = process.env.TENANT_VPS_SSH_KEY ?? '/home/clawd/.ssh/id_ed25519_hfsp_provisioner';
-const TENANT_VPS_BASEDIR = process.env.TENANT_VPS_BASEDIR ?? '/opt/hfsp/tenants';
-const TENANT_RUNTIME_IMAGE = process.env.TENANT_RUNTIME_IMAGE ?? 'hfsp/openclaw-runtime:stable';
-const TENANT_VPS_SSH_OPTS = ['-i', TENANT_VPS_SSH_KEY, '-o', 'StrictHostKeyChecking=accept-new'];
+// Local tenant provisioning via ShellProvisioner
+const TENANT_BASEDIR = process.env.TENANT_BASEDIR ?? '/home/hfsp/tenants';
+const OPENCLAW_IMAGE = process.env.OPENCLAW_IMAGE ?? 'hfsp-openclaw-runtime:local';
+const HFSP_SECRETS_DIR = process.env.HFSP_SECRETS_DIR ?? '/home/hfsp/.openclaw/secrets';
+const GATEWAY_HOST = process.env.GATEWAY_HOST ?? 'agents.hfsp.cloud';
+const provisioner = new ShellProvisioner(new PortRegistry(), new NginxManager());
 
 function readToken(): string {
   const t = fs.readFileSync(TOKEN_FILE, 'utf8').trim();
@@ -179,6 +181,7 @@ try { db.exec(`ALTER TABLE tenants ADD COLUMN telegram_token_fp TEXT`); } catch 
 try { db.exec(`ALTER TABLE tenants ADD COLUMN status TEXT NOT NULL DEFAULT 'active'`); } catch {}
 try { db.exec(`ALTER TABLE tenants ADD COLUMN archived_at TEXT`); } catch {}
 try { db.exec(`ALTER TABLE tenants ADD COLUMN deleted_at TEXT`); } catch {}
+try { db.exec(`ALTER TABLE tenants ADD COLUMN public_url TEXT`); } catch {}
 
 const BOT_TOKEN = readToken();
 const TELEGRAM_API = `https://api.telegram.org/bot${BOT_TOKEN}`;
@@ -444,13 +447,7 @@ function shSingleQuote(s: string): string {
   return `'${s.replace(/'/g, `'\\''`)}'`;
 }
 
-function sshTenant(command: string): string {
-  return execFileSync(
-    'ssh',
-    [...TENANT_VPS_SSH_OPTS, `${TENANT_VPS_USER}@${TENANT_VPS_HOST}`, command],
-    { encoding: 'utf8' }
-  ).trim();
-}
+
 
 async function renderChoosePreset(chatId: number) {
   await sendMessage(
@@ -745,7 +742,7 @@ app.post('/telegram/webhook', async (req, res) => {
         // Stop the old container so the token can be reused safely.
         try {
           const oldContainer = `hfsp_${conflictTenant}`;
-          sshTenant(`docker rm -f ${oldContainer} >/dev/null 2>&1 || true`);
+          execFileSync('docker', ['rm', '-f', oldContainer], { stdio: 'ignore' });
           db.prepare(`UPDATE tenants SET status='archived', archived_at=datetime('now') WHERE telegram_user_id=? AND tenant_id=?`).run(telegramUserId, conflictTenant);
         } catch (err) {
           console.error('token replace stop old container failed', err);
@@ -910,7 +907,7 @@ app.post('/telegram/webhook', async (req, res) => {
       // Provision: create tenant + start container
       if (data === 'provision:start' || data === 'provision:retry') {
         try {
-          await sendMessage(chatId, data === 'provision:retry' ? 'Retrying provisioning…' : 'Provisioning… (creating tenant + dashboard key)');
+          await sendMessage(chatId, data === 'provision:retry' ? 'Retrying provisioning…' : 'Provisioning… creating your agent.');
 
           const templateOk = Boolean(w.data.templateId);
           const providerOk = Boolean(w.data.provider);
@@ -918,56 +915,33 @@ app.post('/telegram/webhook', async (req, res) => {
           const keyOk = Boolean(w.data.openaiApiKey || w.data.anthropicApiKey);
 
           if (!templateOk || !providerOk || !presetOk || !keyOk) {
-            await sendMessage(chatId, 'You’re missing some setup steps. Tap Status and finish the missing items.');
+            await sendMessage(chatId, 'You\'re missing some setup steps. Tap Status and finish the missing items.');
             return;
           }
 
           // Either create a new tenant record, or retry the most recent failed/provisioning tenant.
           let tenantId: string;
-          let dashboardPort: number;
 
           if (data === 'provision:retry') {
             const last = db
               .prepare(
-                `SELECT tenant_id, dashboard_port
-                 FROM tenants
+                `SELECT tenant_id FROM tenants
                  WHERE telegram_user_id = ?
                    AND status IN ('provisioning','failed')
                    AND (deleted_at IS NULL)
-                 ORDER BY created_at DESC
-                 LIMIT 1`
+                 ORDER BY created_at DESC LIMIT 1`
               )
               .get(telegramUserId) as any;
-            if (!last?.tenant_id || !last?.dashboard_port) {
+            if (!last?.tenant_id) {
               await sendMessage(chatId, 'No failed provisioning found to retry. Tap Status → Provision agent.');
               return;
             }
             tenantId = String(last.tenant_id);
-            dashboardPort = Number(last.dashboard_port);
           } else {
             tenantId = `t_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
-
-            // Allocate a unique dashboard port (avoid collisions)
-            function allocateDashboardPort(): number {
-              const used = new Set<number>(
-                (db.prepare("SELECT dashboard_port FROM tenants WHERE dashboard_port IS NOT NULL AND (status IS NULL OR status != 'deleted')").all() as any[])
-                  .map((r) => Number(r.dashboard_port))
-                  .filter((n) => Number.isFinite(n))
-              );
-              for (let i = 0; i < 2000; i++) {
-                const p = 19000 + Math.floor(Math.random() * 1000);
-                if (!used.has(p)) return p;
-              }
-              // fallback: linear scan
-              for (let p = 19000; p < 20000; p++) if (!used.has(p)) return p;
-              throw new Error('No free dashboard ports available (19000-19999).');
-            }
-
-            dashboardPort = allocateDashboardPort();
-
             db.prepare(
-              `INSERT INTO tenants(tenant_id, telegram_user_id, agent_name, bot_username, template_id, provider, model_preset, dashboard_port, gateway_token, telegram_token_fp, status)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+              `INSERT INTO tenants(tenant_id, telegram_user_id, agent_name, bot_username, template_id, provider, model_preset, gateway_token, telegram_token_fp, status)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
             ).run(
               tenantId,
               telegramUserId,
@@ -976,144 +950,108 @@ app.post('/telegram/webhook', async (req, res) => {
               w.data.templateId ?? null,
               w.data.provider ?? null,
               w.data.modelPreset ?? null,
-              dashboardPort,
               null,
               w.data.botTokenFp ?? null,
               'provisioning'
             );
           }
 
-          // Record context immediately so retries/pairing have the tenant id.
-          setWizard(telegramUserId, 'await_pairing_code', {
-            ...w.data,
-            lastTenantId: tenantId,
-            lastDashboardPort: dashboardPort
-          });
-
-          // Mark status provisioning on retry too
           db.prepare(`UPDATE tenants SET status='provisioning' WHERE tenant_id = ?`).run(tenantId);
-
-          // Generate a one-time SSH key for dashboard tunnel
-          // (On retry, generate a new key and add it; old keys may remain in authorized_keys.)
-          const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'hfsp-dash-'));
-          const keyBase = path.join(tmpDir, `hfsp_${tenantId}`);
-          execFileSync('ssh-keygen', ['-t', 'ed25519', '-C', tenantId, '-f', keyBase, '-N', ''], { stdio: 'ignore' });
-          const pub = fs.readFileSync(`${keyBase}.pub`, 'utf8').trim();
+          setWizard(telegramUserId, 'await_pairing_code', { ...w.data, lastTenantId: tenantId });
 
           await sendMessage(chatId, `Tenant: ${tenantId}`);
 
-          // Install dash tunnel key automatically on tenant VPS via restricted sudo helper.
-          const out = sshTenant(`sudo /usr/local/bin/hfsp_dash_allow_key ${dashboardPort} ${shSingleQuote(pub)}`);
-          if (!out.includes('OK')) throw new Error(`Tenant VPS key install unexpected output: ${out}`);
-
-          // Ensure tenant directory exists (requires one-time chown of /opt/hfsp to tenant).
-          const tenantDir = `${TENANT_VPS_BASEDIR}/${tenantId}`;
+          // Build per-tenant directory structure
+          const tenantDir = `${TENANT_BASEDIR}/${tenantId}`;
           const workspaceDir = `${tenantDir}/workspace`;
           const secretsDir = `${tenantDir}/secrets`;
-          sshTenant(`mkdir -p ${workspaceDir} ${secretsDir}`);
+          const configPath = `${tenantDir}/openclaw.json`;
 
-          // Write tenant secrets
+          fs.mkdirSync(workspaceDir, { recursive: true });
+          fs.mkdirSync(secretsDir, { recursive: true, mode: 0o700 });
+
+          // Write tenant-specific secrets
           const telegramToken = (w.data.botToken ?? '').trim();
-          const telegramTokenB64 = Buffer.from(telegramToken + '\n').toString('base64');
-          sshTenant(`bash -lc 'echo ${shSingleQuote(telegramTokenB64)} | base64 -d > ${secretsDir}/telegram.token'`);
+          fs.writeFileSync(`${secretsDir}/telegram.token`, telegramToken + '\n', { mode: 0o600 });
 
-          if (w.data.provider === 'openai' && w.data.openaiApiKey) {
-            const k = Buffer.from(w.data.openaiApiKey.trim() + '\n').toString('base64');
-            sshTenant(`bash -lc 'echo ${shSingleQuote(k)} | base64 -d > ${secretsDir}/openai.key'`);
-          }
           if (w.data.provider === 'anthropic' && w.data.anthropicApiKey) {
-            const k = Buffer.from(w.data.anthropicApiKey.trim() + '\n').toString('base64');
-            sshTenant(`bash -lc 'echo ${shSingleQuote(k)} | base64 -d > ${secretsDir}/anthropic.key'`);
+            fs.writeFileSync(`${secretsDir}/anthropic.key`, w.data.anthropicApiKey.trim() + '\n', { mode: 0o600 });
           }
+          if (w.data.provider === 'openai' && w.data.openaiApiKey) {
+            fs.writeFileSync(`${secretsDir}/openai.key`, w.data.openaiApiKey.trim() + '\n', { mode: 0o600 });
+          }
+
+          // Copy shared SSH creds required by the container entrypoint
+          fs.copyFileSync(`${HFSP_SECRETS_DIR}/ssh_identity`, `${secretsDir}/ssh_identity`);
+          fs.chmodSync(`${secretsDir}/ssh_identity`, 0o600);
+          fs.copyFileSync(`${HFSP_SECRETS_DIR}/ssh_known_hosts`, `${secretsDir}/ssh_known_hosts`);
+
+          // Generate gateway auth token
+          const row0 = db.prepare(`SELECT gateway_token FROM tenants WHERE tenant_id = ?`).get(tenantId) as any;
+          const existingToken = row0?.gateway_token ? (() => { try { return decryptString(String(row0.gateway_token)); } catch { return null; } })() : null;
+          const gatewayToken = existingToken ?? Buffer.from(`${tenantId}:${Math.random().toString(36).slice(2)}`).toString('hex').slice(0, 48);
+          db.prepare(`UPDATE tenants SET gateway_token = ? WHERE tenant_id = ?`).run(encryptString(gatewayToken), tenantId);
 
           // Write tenant openclaw.json
-          // Reuse existing gateway token if present; otherwise generate.
-          const row0 = db.prepare(`SELECT gateway_token FROM tenants WHERE tenant_id = ?`).get(tenantId) as any;
-          const row = unprotectTenantRowTokens(row0);
-          const gatewayToken = row?.gateway_token ? String(row.gateway_token) : Buffer.from(`${tenantId}:${Math.random().toString(36).slice(2)}`).toString('hex').slice(0, 48);
-          // persist token for Advanced dashboard access instructions (encrypted)
-          db.prepare(`UPDATE tenants SET gateway_token = ? WHERE tenant_id = ?`).run(encryptString(gatewayToken), tenantId);
           const openclawConfig = {
             agents: {
-              defaults: {
-                workspace: '/tenant/workspace'
-              },
-              list: [
-                {
-                  id: 'main',
-                  default: true,
-                  name: w.data.templateId === 'ops_starter' ? 'Ops Starter' : 'Blank',
-                  workspace: '/tenant/workspace',
-                  identity: { name: w.data.agentName ?? 'Agent', emoji: '🧭' }
-                }
-              ]
+              defaults: { workspace: '/tenant/workspace' },
+              list: [{
+                id: 'main',
+                default: true,
+                name: w.data.templateId === 'ops_starter' ? 'Ops Starter' : 'Blank',
+                workspace: '/tenant/workspace',
+                identity: { name: w.data.agentName ?? 'Agent', emoji: '🧭' }
+              }]
             },
             gateway: {
-              port: dashboardPort,
               bind: 'lan',
               mode: 'local',
               auth: { mode: 'token', token: gatewayToken },
-              controlUi: {
-                enabled: true,
-                allowedOrigins: [`http://localhost:${dashboardPort}`, `http://127.0.0.1:${dashboardPort}`]
-              }
+              controlUi: { enabled: true }
             },
             plugins: { entries: { telegram: { enabled: true } } },
             channels: {
               telegram: {
                 enabled: true,
-                // Configure account directly (avoid doctor migration from single-account fields)
                 accounts: {
                   default: {
                     enabled: true,
                     dmPolicy: 'pairing',
                     groupPolicy: 'disabled',
-                    tokenFile: '/home/clawd/.openclaw/secrets/telegram.token',
+                    tokenFile: '/home/hfsp/.openclaw/secrets/telegram.token',
                     streaming: 'off'
                   }
                 }
               }
             },
-            bindings: [
-              { agentId: 'main', match: { channel: 'telegram', accountId: 'default' } }
-            ]
+            bindings: [{ agentId: 'main', match: { channel: 'telegram', accountId: 'default' } }]
           };
+          fs.writeFileSync(configPath, JSON.stringify(openclawConfig, null, 2), { mode: 0o600 });
 
-          const configB64 = Buffer.from(JSON.stringify(openclawConfig, null, 2)).toString('base64');
-          sshTenant(`bash -lc 'echo ${shSingleQuote(configB64)} | base64 -d > ${tenantDir}/openclaw.json'`);
+          // Provision container
+          const result = await provisioner.provision({
+            tenantId,
+            image: OPENCLAW_IMAGE,
+            surface: 'telegram',
+            containerName: `hfsp_${tenantId}`,
+            workspacePath: workspaceDir,
+            secretsPath: secretsDir,
+            configPath,
+          });
 
-          // Start tenant container (dashboard bound to host loopback only)
-          const containerName = `hfsp_${tenantId}`;
-          // Stop/remove existing container if present
-          sshTenant(`docker rm -f ${containerName} >/dev/null 2>&1 || true`);
+          if (!result.ok) throw new Error(result.error ?? 'Provision failed');
 
-          const runCmd = [
-            'docker run -d',
-            `--name ${containerName}`,
-            '--restart unless-stopped',
-            `-p 127.0.0.1:${dashboardPort}:${dashboardPort}`,
-            `-v ${workspaceDir}:/tenant/workspace`,
-            `-v ${tenantDir}/openclaw.json:/home/clawd/.openclaw/openclaw.json:ro`,
-            `-v ${secretsDir}:/home/clawd/.openclaw/secrets:ro`,
-            TENANT_RUNTIME_IMAGE
-          ].join(' ');
+          // Persist port + public URL
+          db.prepare(
+            `UPDATE tenants SET status='active', dashboard_port=?, public_url=?, gateway_token=? WHERE tenant_id=?`
+          ).run(result.gatewayPort, result.publicUrl, encryptString(gatewayToken), tenantId);
 
-          sshTenant(runCmd);
-
-          // Fix workspace permissions (host bind-mount is owned by user `tenant`; container runs as uid 10001).
-          // Do it inside the container as root so it works without requiring sudo/root on the tenant VPS.
-          sshTenant(`docker exec -u root ${containerName} bash -lc ${shSingleQuote('chown -R 10001:10001 /tenant/workspace || true; chmod -R u+rwX /tenant/workspace || true')}`);
-
-          // Save last tenant info for pairing + Advanced dashboard access
           setWizard(telegramUserId, 'await_pairing_code', {
             ...w.data,
             lastTenantId: tenantId,
-            lastDashboardPort: dashboardPort,
             lastGatewayToken: gatewayToken
           });
-
-          // Send dashboard key as a document, but do NOT show any SSH commands unless the user taps Advanced.
-          await sendDocument(chatId, keyBase, `hfsp_${tenantId}.key`, 'Dashboard SSH key (keep it private). You’ll only need this if you choose Dashboard access (Advanced).');
 
           const botLink = w.data.botUsername ? `https://t.me/${w.data.botUsername}` : undefined;
 
@@ -1131,7 +1069,7 @@ app.post('/telegram/webhook', async (req, res) => {
               reply_markup: {
                 inline_keyboard: [
                   botLink ? [{ text: 'Open your bot', url: botLink }] : [{ text: 'Open your bot', callback_data: 'noop' }],
-                  [{ text: 'Dashboard access (Advanced)', callback_data: 'advanced:dashboard' }],
+                  [{ text: 'Gateway access (Advanced)', callback_data: 'advanced:dashboard' }],
                   [{ text: 'Cancel', callback_data: 'flow:cancel' }]
                 ]
               }
@@ -1139,12 +1077,9 @@ app.post('/telegram/webhook', async (req, res) => {
           );
 
           db.prepare(`UPDATE tenants SET status='active' WHERE tenant_id = ?`).run(tenantId);
-
-          // Do not show SSH/tunnel commands by default.
           return;
         } catch (err) {
           console.error('Provision error', err);
-          // best-effort: mark last tenant as failed
           try {
             const w2 = getWizard(telegramUserId);
             if (w2.data.lastTenantId) {
@@ -1242,21 +1177,7 @@ app.post('/telegram/webhook', async (req, res) => {
           )
           .get(telegramUserId, tenantId) as any;
 
-        // Backfill bot username for older tenants (created before we stored bot_username)
-        if (r && !r.bot_username) {
-          try {
-            const containerName = `hfsp_${tenantId}`;
-            const out = sshTenant(`docker exec -u clawd ${containerName} bash -lc ${shSingleQuote('HOME=/home/clawd openclaw channels status --probe')}`);
-            const m = out.match(/bot:@([A-Za-z0-9_]+)/);
-            if (m?.[1]) {
-              const uname = m[1];
-              db.prepare(`UPDATE tenants SET bot_username = ? WHERE tenant_id = ?`).run(uname, tenantId);
-              r = { ...r, bot_username: uname };
-            }
-          } catch {
-            // ignore; keep Bot: —
-          }
-        }
+
 
         if (!r) {
           await sendMessage(chatId, 'Agent not found.');
@@ -1322,7 +1243,7 @@ app.post('/telegram/webhook', async (req, res) => {
         const containerName = `hfsp_${tenantId}`;
         await sendMessage(chatId, 'Running health check…');
         try {
-          const out = sshTenant(`docker exec -u clawd ${containerName} bash -lc ${shSingleQuote('HOME=/home/clawd openclaw channels status --probe')}`);
+          const out = execFileSync('docker', ['exec', containerName, 'bash', '-lc', 'HOME=/home/hfsp openclaw channels status --probe'], { encoding: 'utf8' }).trim();
           await sendMessage(chatId, `Health check ✅\n\n${out}`);
         } catch (err) {
           console.error('health check failed', err);
@@ -1358,7 +1279,7 @@ app.post('/telegram/webhook', async (req, res) => {
         const tenantId = data.split(':').slice(2).join(':');
         const containerName = `hfsp_${tenantId}`;
         try {
-          sshTenant(`docker stop ${containerName} >/dev/null 2>&1 || true`);
+          await provisioner.stop(tenantId);
           db.prepare(`UPDATE tenants SET status='stopped' WHERE telegram_user_id=? AND tenant_id=?`).run(telegramUserId, tenantId);
           await sendMessage(chatId, 'Stopped ✅');
         } catch (err) {
@@ -1374,7 +1295,7 @@ app.post('/telegram/webhook', async (req, res) => {
         const containerName = `hfsp_${tenantId}`;
         await sendMessage(chatId, 'Restarting…');
         try {
-          sshTenant(`docker restart ${containerName} >/dev/null 2>&1 || true`);
+          execFileSync('docker', ['restart', containerName], { stdio: 'ignore' });
           db.prepare(`UPDATE tenants SET status='active' WHERE telegram_user_id=? AND tenant_id=?`).run(telegramUserId, tenantId);
           await sendMessage(chatId, 'Restarted ✅');
         } catch (err) {
@@ -1412,13 +1333,13 @@ app.post('/telegram/webhook', async (req, res) => {
       if (data?.startsWith('agent:delete_do:')) {
         const tenantId = data.split(':').slice(2).join(':');
         const containerName = `hfsp_${tenantId}`;
-        const tenantDir = `${TENANT_VPS_BASEDIR}/${tenantId}`;
-        const trashDir = `${TENANT_VPS_BASEDIR}/.trash/${tenantId}-${Date.now()}`;
+        const tenantDir = `${TENANT_BASEDIR}/${tenantId}`;
+        const trashDir = `${TENANT_BASEDIR}/.trash/${tenantId}-${Date.now()}`;
         try {
-          // best-effort stop/remove container
-          sshTenant(`docker rm -f ${containerName} >/dev/null 2>&1 || true`);
+          await provisioner.remove(tenantId);
           // move tenant dir to trash for recoverability
-          sshTenant(`mkdir -p ${TENANT_VPS_BASEDIR}/.trash && (mv ${tenantDir} ${trashDir} 2>/dev/null || true)`);
+          fs.mkdirSync(`${TENANT_BASEDIR}/.trash`, { recursive: true });
+          try { fs.renameSync(tenantDir, trashDir); } catch { /* dir may not exist */ }
           db.prepare(`UPDATE tenants SET status='deleted', deleted_at=datetime('now') WHERE telegram_user_id=? AND tenant_id=?`).run(telegramUserId, tenantId);
           await sendMessage(chatId, 'Deleted ✅');
           await sendMessage(chatId, 'Back to your agents:', { reply_markup: { inline_keyboard: [[{ text: 'My agents', callback_data: 'agents:list' }], [{ text: 'Show archived', callback_data: 'agents:list_archived' }]] } });
@@ -1433,118 +1354,36 @@ app.post('/telegram/webhook', async (req, res) => {
         const tenantId = data.split(':').slice(2).join(':');
         const r0 = db
           .prepare(
-            `SELECT tenant_id, dashboard_port, gateway_token
+            `SELECT tenant_id, public_url, gateway_token
              FROM tenants
              WHERE telegram_user_id = ? AND tenant_id = ? AND (status IS NULL OR status != 'deleted')`
           )
           .get(telegramUserId, tenantId) as any;
         const r = unprotectTenantRowTokens(r0);
 
-        if (!r?.dashboard_port || !r?.gateway_token) {
-          await sendMessage(chatId, 'Missing dashboard details for this agent.');
+        if (!r?.public_url || !r?.gateway_token) {
+          await sendMessage(chatId, 'Missing dashboard details for this agent. Provision it first.');
           return;
         }
 
         await sendMessage(
           chatId,
           [
-            'Dashboard access (Advanced)',
+            'Gateway access:',
             '',
-            'Choose a method:',
+            `URL: ${r.public_url}`,
+            `Token: ${r.gateway_token}`,
             '',
-            '• One-liner (recommended): copy/paste into Terminal (no Gatekeeper prompts)',
-            '• Launcher file: download & run'
+            'Use these to connect the OpenClaw desktop app or any compatible client.'
           ].join('\n'),
           {
             reply_markup: {
               inline_keyboard: [
-                [{ text: 'One-liner (recommended)', callback_data: `agent:dashboard_oneliner:${tenantId}` }],
-                [{ text: 'Launcher file…', callback_data: `agent:dashboard_launcher:${tenantId}` }],
                 [{ text: 'Back', callback_data: `agent:details:${tenantId}` }]
               ]
             }
           }
         );
-        return;
-      }
-
-      if (data?.startsWith('agent:dashboard_oneliner:')) {
-        const tenantId = data.split(':').slice(2).join(':');
-        await sendMessage(
-          chatId,
-          'Where did you save the SSH key file?',
-          {
-            reply_markup: {
-              inline_keyboard: [
-                [{ text: 'Downloads (recommended)', callback_data: `agent:dashboard_oneliner_loc:${tenantId}:Downloads` }],
-                [{ text: 'Desktop', callback_data: `agent:dashboard_oneliner_loc:${tenantId}:Desktop` }],
-                [{ text: 'I’m not sure', callback_data: `agent:dashboard_oneliner_loc:${tenantId}:Find` }],
-                [{ text: 'Back', callback_data: `agent:dashboard:${tenantId}` }]
-              ]
-            }
-          }
-        );
-        return;
-      }
-
-      if (data?.startsWith('agent:dashboard_oneliner_loc:')) {
-        const parts = data.split(':');
-        const tenantId = parts[2] ?? '';
-        const loc = parts[3] ?? 'Downloads';
-
-        const r0 = db
-          .prepare(
-            `SELECT tenant_id, dashboard_port, gateway_token
-             FROM tenants
-             WHERE telegram_user_id = ? AND tenant_id = ? AND (status IS NULL OR status != 'deleted')`
-          )
-          .get(telegramUserId, tenantId) as any;
-        const r = unprotectTenantRowTokens(r0);
-
-        if (!r?.dashboard_port || !r?.gateway_token) {
-          await sendMessage(chatId, 'Missing dashboard details for this agent.');
-          return;
-        }
-
-        const port = Number(r.dashboard_port);
-        const url = `http://127.0.0.1:${port}`;
-        const keyFile = `hfsp_${tenantId}.key`;
-
-        let cdPath = '~/Downloads';
-        if (loc === 'Desktop') cdPath = '~/Desktop';
-
-        const cmd = `cd ${cdPath} && chmod 600 ${keyFile} && ssh -i ${keyFile} -N -L ${port}:127.0.0.1:${port} dash@${TENANT_VPS_HOST}`;
-        const findCmd = `find ~ -maxdepth 2 -name ${keyFile} 2>/dev/null`;
-
-        await sendMessage(
-          chatId,
-          [
-            'Copy/paste this into Terminal (Mac/Linux):',
-            cmd,
-            '',
-            `Then open: ${url}`,
-            '',
-            'Dashboard token (if prompted):',
-            String(r.gateway_token),
-            '',
-            loc === 'Find' ? `If you can’t find the key, run:\n${findCmd}` : ''
-          ].filter(Boolean).join('\n')
-        );
-        return;
-      }
-
-      if (data?.startsWith('agent:dashboard_launcher:')) {
-        const tenantId = data.split(':').slice(2).join(':');
-        await sendMessage(chatId, 'Choose your computer:', {
-          reply_markup: {
-            inline_keyboard: [
-              [{ text: 'Mac', callback_data: `agent:dashboard_os:${tenantId}:mac` }],
-              [{ text: 'Windows', callback_data: `agent:dashboard_os:${tenantId}:windows` }],
-              [{ text: 'Linux', callback_data: `agent:dashboard_os:${tenantId}:linux` }],
-              [{ text: 'Back', callback_data: `agent:details:${tenantId}` }]
-            ]
-          }
-        });
         return;
       }
 
@@ -1583,110 +1422,6 @@ app.post('/telegram/webhook', async (req, res) => {
         return;
       }
 
-      const ensuredChatId: number = chatId;
-      async function sendDashboardLauncher(params: { tenantId: string; port: number; token: string; osKey: string }) {
-        const { tenantId, port, token, osKey } = params;
-        const keyFile = `hfsp_${tenantId}.key`;
-        const url = `http://127.0.0.1:${port}`;
-
-        let filename = '';
-        let content = '';
-        let caption = '';
-
-        if (osKey === 'mac') {
-          filename = `connect-dashboard-${tenantId}.command`;
-          content = [
-            '#!/usr/bin/env bash',
-            'set -euo pipefail',
-            '',
-            `cd "$(dirname "$0")"`,
-            `chmod 600 "${keyFile}" 2>/dev/null || true`,
-            `echo "Starting tunnel… Keep this window open."`,
-            `echo "Then open: ${url}"`,
-            `ssh -i "./${keyFile}" -N -L ${port}:127.0.0.1:${port} dash@${TENANT_VPS_HOST}`
-          ].join('\n');
-          caption = `Mac launcher. Put it in the same folder as ${keyFile}, then double-click.`;
-        } else if (osKey === 'windows') {
-          filename = `connect-dashboard-${tenantId}.ps1`;
-          content = [
-            '$ErrorActionPreference = "Stop"',
-            `$here = Split-Path -Parent $MyInvocation.MyCommand.Path`,
-            'Set-Location $here',
-            `Write-Host "Starting tunnel… Keep this window open."`,
-            `Write-Host "Then open: ${url}"`,
-            `ssh -i .\\${keyFile} -N -L ${port}:127.0.0.1:${port} dash@${TENANT_VPS_HOST}`
-          ].join('\r\n');
-          caption = `Windows launcher. Save it next to ${keyFile}, right-click → Run with PowerShell.`;
-        } else {
-          filename = `connect-dashboard-${tenantId}.sh`;
-          content = [
-            '#!/usr/bin/env bash',
-            'set -euo pipefail',
-            '',
-            `cd "$(dirname "$0")"`,
-            `chmod 600 "${keyFile}" 2>/dev/null || true`,
-            `echo "Starting tunnel… Keep this window open."`,
-            `echo "Then open: ${url}"`,
-            `ssh -i "./${keyFile}" -N -L ${port}:127.0.0.1:${port} dash@${TENANT_VPS_HOST}`
-          ].join('\n');
-          caption = `Linux launcher. Save it next to ${keyFile}, then run: chmod +x ${filename} && ./${filename}`;
-        }
-
-        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'hfsp-dash-launch-'));
-        const outPath = path.join(tmpDir, filename);
-        fs.writeFileSync(outPath, content, { encoding: 'utf8', mode: 0o600 });
-
-        await sendDocument(ensuredChatId, outPath, filename, caption);
-
-        await sendMessage(
-          ensuredChatId,
-          [
-            'Dashboard token (if prompted):',
-            token,
-            '',
-            `Open after tunnel starts: ${url}`
-          ].join('\n')
-        );
-      }
-
-      if (data?.startsWith('advanced:dashboard:os:')) {
-        const osKey = data.split(':')[3];
-        const w2 = getWizard(telegramUserId);
-        const tenantId = w2.data.lastTenantId;
-        const port = w2.data.lastDashboardPort;
-        const token = w2.data.lastGatewayToken;
-        if (!tenantId || !port || !token) {
-          await sendMessage(chatId, 'Missing dashboard context. Tap Status → Provision agent again.');
-          return;
-        }
-
-        await sendDashboardLauncher({ tenantId, port, token, osKey });
-        return;
-      }
-
-      if (data?.startsWith('agent:dashboard_os:')) {
-        const parts = data.split(':');
-        // agent:dashboard_os:<tenantId>:<os>
-        const tenantId = parts[2] ?? '';
-        const osKey = parts[3] ?? '';
-
-        const r0 = db
-          .prepare(
-            `SELECT tenant_id, dashboard_port, gateway_token
-             FROM tenants
-             WHERE telegram_user_id = ? AND tenant_id = ? AND (status IS NULL OR status != 'deleted')`
-          )
-          .get(telegramUserId, tenantId) as any;
-        const r = unprotectTenantRowTokens(r0);
-
-        if (!r?.dashboard_port || !r?.gateway_token) {
-          await sendMessage(chatId, 'Missing dashboard details for this agent.');
-          return;
-        }
-
-        await sendDashboardLauncher({ tenantId, port: Number(r.dashboard_port), token: String(r.gateway_token), osKey });
-        return;
-      }
 
       // Unknown callback
       await sendMenu(chatId);
@@ -2018,11 +1753,7 @@ app.post('/telegram/webhook', async (req, res) => {
       await sendMessage(chatId, 'Pairing…');
       try {
         const containerName = `hfsp_${tenantId}`;
-        // Approve pairing inside tenant container as the runtime user.
-        // Critical: ensure HOME points at /home/clawd so OpenClaw uses the mounted config.
-        const approveInner = `HOME=/home/clawd openclaw pairing approve telegram ${code}`;
-        const cmd = `docker exec -u clawd ${containerName} bash -lc ${shSingleQuote(approveInner)}`;
-        const out = sshTenant(cmd);
+        const out = execFileSync('docker', ['exec', containerName, 'bash', '-lc', `HOME=/home/hfsp openclaw pairing approve telegram ${code}`], { encoding: 'utf8' }).trim();
         await sendMessage(chatId, `Paired ✅\n${out ? out : ''}`.trim());
         setWizard(telegramUserId, 'idle', { ...w.data });
         await sendMenu(chatId);
@@ -2050,6 +1781,6 @@ app.post('/telegram/webhook', async (req, res) => {
 app.listen(PORT, '127.0.0.1', () => {
   console.log(`Storefront bot webhook listening on http://127.0.0.1:${PORT}`);
   console.log(`DB: ${DB_PATH}`);
-  console.log(`Tenant VPS: ${TENANT_VPS_USER}@${TENANT_VPS_HOST} (key=${TENANT_VPS_SSH_KEY}) baseDir=${TENANT_VPS_BASEDIR}`);
-  console.log(`Tenant runtime image: ${TENANT_RUNTIME_IMAGE}`);
+  console.log(`Tenant basedir: ${TENANT_BASEDIR}`);
+  console.log(`OpenClaw image: ${OPENCLAW_IMAGE}`);
 });
