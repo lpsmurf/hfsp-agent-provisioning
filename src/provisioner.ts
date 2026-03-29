@@ -76,10 +76,15 @@ export class ShellProvisioner implements Provisioner {
         ...(config.env ?? {}),
       };
 
+      await this.checkCapacity();
+
       const createCmd = [
         "docker create",
         `--name ${shEscape(name)}`,
         "--restart unless-stopped",
+        "--memory 512m",
+        "--memory-swap 512m",
+        "--cpus 0.75",
         `-p 127.0.0.1:${port}:${port}`,   // bind host-side to loopback only
         ...buildEnvArgs(env),
         `-v ${shEscape(config.configPath)}:/run/openclaw/openclaw.json:ro`,
@@ -215,6 +220,26 @@ export class ShellProvisioner implements Provisioner {
       await this.sleep(1500);
     }
     return false;
+  }
+
+  // Preflight: refuse to provision if host is low on memory or disk.
+  // Thresholds: <300 MB free RAM or <2 GB free disk.
+  private async checkCapacity(): Promise<void> {
+    const memOut = await this.exec("awk '/MemAvailable/ {print $2}' /proc/meminfo");
+    const memKb = parseInt(memOut.trim(), 10);
+    if (!isNaN(memKb) && memKb < 300_000) {
+      throw new Error(
+        `CAPACITY_MEMORY: Only ${Math.round(memKb / 1024)} MB RAM available. Provision refused.`
+      );
+    }
+
+    const diskOut = await this.exec("df --output=avail / | tail -1");
+    const diskKb = parseInt(diskOut.trim(), 10);
+    if (!isNaN(diskKb) && diskKb < 2_097_152) { // 2 GB in KB
+      throw new Error(
+        `CAPACITY_DISK: Only ${Math.round(diskKb / 1024 / 1024)} GB disk available. Provision refused.`
+      );
+    }
   }
 
   private nameFor(tenantId: string): string {

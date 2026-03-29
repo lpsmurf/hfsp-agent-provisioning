@@ -1,0 +1,17 @@
+[Unit]
+Description=HFSP Admin Dashboard
+After=network.target
+
+[Service]
+Type=simple
+User=hfsp
+WorkingDirectory=/home/hfsp/hfsp-agent-provisioning
+Environment=ADMIN_PORT=3002
+ExecStart=/usr/bin/npx ts-node --transpile-only services/admin-dashboard/src/index.ts
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

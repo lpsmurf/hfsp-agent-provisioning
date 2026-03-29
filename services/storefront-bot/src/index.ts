@@ -906,6 +906,21 @@ app.post('/telegram/webhook', async (req, res) => {
 
       // Provision: create tenant + start container
       if (data === 'provision:start' || data === 'provision:retry') {
+        // Per-user agent cap
+        if (data === 'provision:start') {
+          const MAX_AGENTS_PER_USER = 1;
+          const capRow = db.prepare(
+            "SELECT COUNT(*) as cnt FROM tenants WHERE telegram_user_id = ? AND status IN ('active','provisioning','stopped') AND deleted_at IS NULL"
+          ).get(telegramUserId) as any;
+          const activeCount = capRow?.cnt ?? 0;
+          if (activeCount >= MAX_AGENTS_PER_USER) {
+            await sendMessage(chatId,
+              `You already have ${activeCount} active agent. Delete it first before creating a new one.`,
+              { reply_markup: { inline_keyboard: [[{ text: 'My Agents', callback_data: 'list_agents' }]] } }
+            );
+            return;
+          }
+        }
         try {
           await sendMessage(chatId, data === 'provision:retry' ? 'Retrying provisioning…' : 'Provisioning… creating your agent.');
 
@@ -1086,18 +1101,23 @@ app.post('/telegram/webhook', async (req, res) => {
               db.prepare(`UPDATE tenants SET status='failed' WHERE tenant_id = ?`).run(w2.data.lastTenantId);
             }
           } catch {}
-          await sendMessage(
-            chatId,
-            `Provisioning failed: ${(err as Error)?.message ?? String(err)}`,
-            {
+          {
+            const rawMsg = (err as Error)?.message ?? String(err);
+            let userMsg = `Provisioning failed: ${rawMsg}`;
+            if (rawMsg.includes('CAPACITY_MEMORY') || rawMsg.includes('CAPACITY_DISK')) {
+              userMsg = '⚠️ Our servers are currently at capacity. We\'ve been notified and are adding more. Please try again in a few hours.';
+            } else if (rawMsg.includes('Port registry exhausted')) {
+              userMsg = '⚠️ All agent slots are currently occupied. We\'re expanding capacity. Please try again soon.';
+            }
+            await sendMessage(chatId, userMsg, {
               reply_markup: {
                 inline_keyboard: [
                   [{ text: 'Retry provisioning', callback_data: 'provision:retry' }],
                   [{ text: 'Cancel', callback_data: 'flow:cancel' }]
                 ]
               }
-            }
-          );
+            });
+          }
           return;
         }
       }
@@ -1554,6 +1574,14 @@ app.post('/telegram/webhook', async (req, res) => {
 
     if (w.step === 'await_agent_name') {
       const agentName = text.trim().slice(0, 60);
+      if (/^\d{8,12}:[A-Za-z0-9_-]{30,}$/.test(agentName)) {
+        await sendMessage(chatId, "That looks like a bot token, not a name. Please enter a friendly name for your agent (e.g. \"Sales Bot\").");
+        return;
+      }
+      if (agentName.length < 2) {
+        await sendMessage(chatId, 'Agent name must be at least 2 characters.');
+        return;
+      }
       transition(telegramUserId, w.step, 'botfather_helper', { ...w.data, agentName });
       await renderBotFatherHelper(chatId);
       return;

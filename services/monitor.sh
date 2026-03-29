@@ -60,6 +60,41 @@ while IFS= read -r name; do
   fi
 done < <(docker ps --filter "name=hfsp_" --format "{{.Names}}" 2>/dev/null)
 
+# 4. Capacity checks
+MEM_AVAIL_KB=$(awk '/MemAvailable/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)
+DISK_AVAIL_KB=$(df --output=avail / 2>/dev/null | tail -1 || echo 0)
+PORT_USED=$(python3 -c "import json,sys; d=json.load(open('/home/hfsp/.openclaw/port-registry.json')); print(len(d))" 2>/dev/null || echo 0)
+PORT_MAX=1000
+
+if [[ "$MEM_AVAIL_KB" -gt 0 && "$MEM_AVAIL_KB" -lt 400000 ]]; then
+  alert "LOW MEMORY: only $((MEM_AVAIL_KB / 1024)) MB available"
+  FAIL=1
+else
+  ok "memory ok ($(( MEM_AVAIL_KB / 1024 )) MB free)"
+fi
+
+if [[ "$DISK_AVAIL_KB" -gt 0 && "$DISK_AVAIL_KB" -lt 3145728 ]]; then  # < 3 GB
+  alert "LOW DISK: only $((DISK_AVAIL_KB / 1024 / 1024)) GB available"
+  FAIL=1
+else
+  ok "disk ok ($((DISK_AVAIL_KB / 1024 / 1024)) GB free)"
+fi
+
+PORT_PCT=$(( PORT_USED * 100 / PORT_MAX ))
+if [[ "$PORT_PCT" -ge 80 ]]; then
+  alert "PORT CAPACITY: ${PORT_USED}/${PORT_MAX} ports allocated (${PORT_PCT}%)"
+  FAIL=1
+else
+  ok "ports ok (${PORT_USED}/${PORT_MAX} used)"
+fi
+
+# 5. Dangling image cleanup (runs quietly, alerts only on unexpected failure)
+PRUNED=$(docker image prune -f 2>&1 || true)
+if echo "$PRUNED" | grep -q "Total reclaimed"; then
+  RECLAIMED=$(echo "$PRUNED" | grep "Total reclaimed" | awk '{print $NF}')
+  ok "docker image prune ran, reclaimed ${RECLAIMED}"
+fi
+
 # Trim log to last 500 lines
 tail -500 "$LOG" > "${LOG}.tmp" && mv "${LOG}.tmp" "$LOG"
 
