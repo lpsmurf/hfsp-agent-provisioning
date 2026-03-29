@@ -1,5 +1,5 @@
-import { ShellProvisioner } from "./provisioner";
-import { PortRegistry } from "./port-registry";
+import { ShellProvisioner } from "../src/provisioner";
+import { PortRegistry } from "../src/port-registry";
 
 const CONFIG_PATH = "/home/hfsp/.openclaw/openclaw.json";
 const SECRETS_PATH = "/home/hfsp/.openclaw/secrets";
