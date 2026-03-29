@@ -1,32 +1,59 @@
 import { ShellProvisioner } from "./provisioner";
+import { PortRegistry } from "./port-registry";
+
+const CONFIG_PATH = "/home/hfsp/.openclaw/openclaw.json";
+const SECRETS_PATH = "/home/hfsp/.openclaw/secrets";
+const IMAGE = "hfsp-openclaw-runtime:local";
 
 async function main() {
-  const tenantId = `test_${Date.now()}`;
-  const provisioner = new ShellProvisioner();
+  const registry = new PortRegistry();
+  const provisioner = new ShellProvisioner(registry);
 
-  console.log(`[test] provisioning tenant: ${tenantId}`);
+  const tenantA = `ta_${Date.now()}`;
+  const tenantB = `tb_${Date.now() + 1}`;
 
-  const result = await provisioner.provision({
-    tenantId,
-    image: "hfsp-openclaw-runtime:local",
-    surface: "telegram",
-    containerName: `hfsp_${tenantId}`,
-    workspacePath: `/tmp/hfsp-workspace-${tenantId}`,
-    secretsPath: `/home/hfsp/.openclaw/secrets`,
-    configPath: `/home/hfsp/.openclaw/openclaw.json`,
-    gatewayPort: 18790,
-  });
+  console.log("[test] provisioning two tenants in parallel...");
 
-  console.log(JSON.stringify(result, null, 2));
+  const [resultA, resultB] = await Promise.all([
+    provisioner.provision({
+      tenantId: tenantA,
+      image: IMAGE,
+      surface: "telegram",
+      containerName: `hfsp_${tenantA}`,
+      workspacePath: `/tmp/ws_${tenantA}`,
+      secretsPath: SECRETS_PATH,
+      configPath: CONFIG_PATH,
+    }),
+    provisioner.provision({
+      tenantId: tenantB,
+      image: IMAGE,
+      surface: "telegram",
+      containerName: `hfsp_${tenantB}`,
+      workspacePath: `/tmp/ws_${tenantB}`,
+      secretsPath: SECRETS_PATH,
+      configPath: CONFIG_PATH,
+    }),
+  ]);
 
-  if (result.ok) {
-    const status = await provisioner.status(tenantId);
-    console.log(JSON.stringify({ status }, null, 2));
-  }
+  console.log("\n=== Tenant A ===");
+  console.log(JSON.stringify(resultA, null, 2));
+  console.log("\n=== Tenant B ===");
+  console.log(JSON.stringify(resultB, null, 2));
 
-  console.log("[test] cleaning up...");
-  await provisioner.stop(tenantId);
-  await provisioner.remove(tenantId);
+  const portsUnique = resultA.gatewayPort !== resultB.gatewayPort;
+  console.log(`\n[test] ports unique: ${portsUnique} (${resultA.gatewayPort} vs ${resultB.gatewayPort})`);
+
+  console.log("\n[test] registry state:");
+  console.log(JSON.stringify(registry.list(), null, 2));
+
+  console.log("\n[test] cleaning up...");
+  await Promise.all([
+    provisioner.stop(tenantA).then(() => provisioner.remove(tenantA)),
+    provisioner.stop(tenantB).then(() => provisioner.remove(tenantB)),
+  ]);
+
+  console.log("[test] registry after cleanup:");
+  console.log(JSON.stringify(registry.list(), null, 2));
   console.log("[test] done");
 }
 

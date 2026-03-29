@@ -1,3 +1,5 @@
+import { PortRegistry } from "./port-registry";
+
 export type Surface = "telegram" | "webapp" | "extension";
 
 export interface ProvisionConfig {
@@ -7,8 +9,8 @@ export interface ProvisionConfig {
   containerName: string;
   workspacePath: string;
   secretsPath: string;
-  configPath: string; // host path to openclaw.json — mounted read-only at staging path
-  gatewayPort: number; // host port mapped to container GATEWAY_PORT
+  configPath: string;     // host path to openclaw.json — staged read-only in container
+  gatewayPort?: number;   // optional: auto-allocated from registry if omitted
   env?: Record<string, string>;
 }
 
@@ -48,10 +50,18 @@ function buildEnvArgs(env: Record<string, string>): string[] {
 }
 
 export class ShellProvisioner implements Provisioner {
+  private registry: PortRegistry;
+
+  constructor(registry?: PortRegistry) {
+    this.registry = registry ?? new PortRegistry();
+  }
+
   async provision(config: ProvisionConfig): Promise<ProvisionResult> {
     const now = new Date().toISOString();
     const name = config.containerName;
-    const port = config.gatewayPort;
+
+    // Allocate port — idempotent if tenant already has one
+    const port = config.gatewayPort ?? this.registry.allocate(config.tenantId);
 
     try {
       await this.exec(`docker rm -f ${shEscape(name)} >/dev/null 2>&1 || true`);
@@ -95,6 +105,8 @@ export class ShellProvisioner implements Provisioner {
         healthPassed: true,
       };
     } catch (err) {
+      // Release port on failure so it doesn't leak
+      if (!config.gatewayPort) this.registry.release(config.tenantId);
       await this.exec(`docker rm -f ${shEscape(name)} >/dev/null 2>&1 || true`);
       return {
         ok: false,
@@ -123,6 +135,7 @@ export class ShellProvisioner implements Provisioner {
   async remove(tenantId: string): Promise<{ ok: boolean; error?: string }> {
     try {
       await this.exec(`docker rm -f ${shEscape(this.nameFor(tenantId))} >/dev/null 2>&1 || true`);
+      this.registry.release(tenantId);
       return { ok: true };
     } catch (err) {
       return { ok: false, error: err instanceof Error ? err.message : String(err) };
@@ -135,15 +148,17 @@ export class ShellProvisioner implements Provisioner {
     running: boolean;
     healthy?: boolean;
     containerName?: string;
+    allocatedPort?: number;
     error?: string;
   }> {
     const containerName = this.nameFor(tenantId);
+    const allocatedPort = this.registry.get(tenantId);
     try {
       const out = await this.exec(
         `docker inspect -f '{{.State.Running}} {{.State.Health.Status}}' ${shEscape(containerName)} 2>/dev/null || true`
       );
       const trimmed = out.trim();
-      if (!trimmed) return { ok: true, exists: false, running: false, containerName };
+      if (!trimmed) return { ok: true, exists: false, running: false, containerName, allocatedPort };
       const [running, health] = trimmed.split(/\s+/);
       return {
         ok: true,
@@ -151,6 +166,7 @@ export class ShellProvisioner implements Provisioner {
         running: running === "true",
         healthy: health === "healthy" ? true : health === "unhealthy" ? false : undefined,
         containerName,
+        allocatedPort,
       };
     } catch (err) {
       return {
@@ -158,6 +174,7 @@ export class ShellProvisioner implements Provisioner {
         exists: false,
         running: false,
         containerName,
+        allocatedPort,
         error: err instanceof Error ? err.message : String(err),
       };
     }
@@ -184,7 +201,7 @@ export class ShellProvisioner implements Provisioner {
         );
         if (out.trim() === "ok") return true;
       } catch {
-        // container may not be ready yet
+        // not ready yet
       }
       await this.sleep(1500);
     }
