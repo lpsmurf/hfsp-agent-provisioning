@@ -11,3 +11,8 @@ dist/
 
 # legacy image build folders not meant for this repo state
 /runtime-image/
+
+# SQLite databases
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
