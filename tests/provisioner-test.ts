@@ -1,5 +1,6 @@
 import { ShellProvisioner } from "../src/provisioner";
 import { PortRegistry } from "../src/port-registry";
+import { NginxManager } from "../src/nginx-manager";
 
 const CONFIG_PATH = "/home/hfsp/.openclaw/openclaw.json";
 const SECRETS_PATH = "/home/hfsp/.openclaw/secrets";
@@ -7,7 +8,8 @@ const IMAGE = "hfsp-openclaw-runtime:local";
 
 async function main() {
   const registry = new PortRegistry();
-  const provisioner = new ShellProvisioner(registry);
+  const nginx = new NginxManager();
+  const provisioner = new ShellProvisioner(registry, nginx);
 
   const tenantA = `ta_${Date.now()}`;
   const tenantB = `tb_${Date.now() + 1}`;
@@ -40,20 +42,23 @@ async function main() {
   console.log("\n=== Tenant B ===");
   console.log(JSON.stringify(resultB, null, 2));
 
-  const portsUnique = resultA.gatewayPort !== resultB.gatewayPort;
-  console.log(`\n[test] ports unique: ${portsUnique} (${resultA.gatewayPort} vs ${resultB.gatewayPort})`);
+  console.log(`\n[test] ports unique: ${resultA.gatewayPort !== resultB.gatewayPort}`);
+  console.log(`[test] public URLs:`);
+  console.log(`  A: ${resultA.publicUrl}`);
+  console.log(`  B: ${resultB.publicUrl}`);
 
-  console.log("\n[test] registry state:");
-  console.log(JSON.stringify(registry.list(), null, 2));
+  console.log("\n[test] nginx conf files:");
+  const { execSync } = await import("node:child_process");
+  console.log(execSync("ls -la /etc/nginx/conf.d/hfsp-tenants/").toString());
 
-  console.log("\n[test] cleaning up...");
+  console.log("[test] cleaning up...");
   await Promise.all([
     provisioner.stop(tenantA).then(() => provisioner.remove(tenantA)),
     provisioner.stop(tenantB).then(() => provisioner.remove(tenantB)),
   ]);
 
-  console.log("[test] registry after cleanup:");
-  console.log(JSON.stringify(registry.list(), null, 2));
+  console.log("[test] nginx conf files after cleanup:");
+  console.log(execSync("ls /etc/nginx/conf.d/hfsp-tenants/").toString().trim() || "(empty)");
   console.log("[test] done");
 }
 

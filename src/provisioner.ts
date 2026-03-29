@@ -1,4 +1,5 @@
 import { PortRegistry } from "./port-registry";
+import { NginxManager } from "./nginx-manager";
 
 export type Surface = "telegram" | "webapp" | "extension";
 
@@ -9,8 +10,8 @@ export interface ProvisionConfig {
   containerName: string;
   workspacePath: string;
   secretsPath: string;
-  configPath: string;     // host path to openclaw.json — staged read-only in container
-  gatewayPort?: number;   // optional: auto-allocated from registry if omitted
+  configPath: string;
+  gatewayPort?: number;   // auto-allocated if omitted
   env?: Record<string, string>;
 }
 
@@ -20,7 +21,8 @@ export interface ProvisionResult {
   containerName: string;
   image: string;
   gatewayPort: number;
-  gatewayUrl: string;
+  gatewayUrl: string;       // internal ws://
+  publicUrl: string;        // external wss:// via nginx
   startedAt: string;
   finishedAt: string;
   healthPassed: boolean;
@@ -37,6 +39,8 @@ export interface Provisioner {
     running: boolean;
     healthy?: boolean;
     containerName?: string;
+    allocatedPort?: number;
+    publicUrl?: string;
     error?: string;
   }>;
 }
@@ -51,16 +55,16 @@ function buildEnvArgs(env: Record<string, string>): string[] {
 
 export class ShellProvisioner implements Provisioner {
   private registry: PortRegistry;
+  private nginx: NginxManager;
 
-  constructor(registry?: PortRegistry) {
+  constructor(registry?: PortRegistry, nginx?: NginxManager) {
     this.registry = registry ?? new PortRegistry();
+    this.nginx = nginx ?? new NginxManager();
   }
 
   async provision(config: ProvisionConfig): Promise<ProvisionResult> {
     const now = new Date().toISOString();
     const name = config.containerName;
-
-    // Allocate port — idempotent if tenant already has one
     const port = config.gatewayPort ?? this.registry.allocate(config.tenantId);
 
     try {
@@ -76,7 +80,7 @@ export class ShellProvisioner implements Provisioner {
         "docker create",
         `--name ${shEscape(name)}`,
         "--restart unless-stopped",
-        `-p ${port}:${port}`,
+        `-p 127.0.0.1:${port}:${port}`,   // bind host-side to loopback only
         ...buildEnvArgs(env),
         `-v ${shEscape(config.configPath)}:/run/openclaw/openclaw.json:ro`,
         `-v ${shEscape(config.workspacePath)}:/tenant/workspace`,
@@ -85,13 +89,21 @@ export class ShellProvisioner implements Provisioner {
       ].join(" ");
 
       await this.exec(createCmd);
+
+      // Update entrypoint uses --bind lan so gateway binds to container eth0
       await this.exec(`docker start ${shEscape(name)}`);
 
       const running = await this.waitForRunning(name, 30_000);
       if (!running) throw new Error("Container did not reach running state");
 
-      const healthPassed = await this.waitForGateway(name, port, 30_000);
+      // Probe from host side — simpler than docker exec, proves port forwarding works
+      const healthPassed = await this.waitForGatewayFromHost(port, 30_000);
       if (!healthPassed) throw new Error("Gateway did not become healthy within 30s");
+
+      // Wire nginx routing
+      await this.nginx.addTenant(config.tenantId, port);
+
+      const publicUrl = this.nginx.gatewayUrl(config.tenantId);
 
       return {
         ok: true,
@@ -100,12 +112,12 @@ export class ShellProvisioner implements Provisioner {
         image: config.image,
         gatewayPort: port,
         gatewayUrl: `ws://127.0.0.1:${port}`,
+        publicUrl,
         startedAt: now,
         finishedAt: new Date().toISOString(),
         healthPassed: true,
       };
     } catch (err) {
-      // Release port on failure so it doesn't leak
       if (!config.gatewayPort) this.registry.release(config.tenantId);
       await this.exec(`docker rm -f ${shEscape(name)} >/dev/null 2>&1 || true`);
       return {
@@ -115,6 +127,7 @@ export class ShellProvisioner implements Provisioner {
         image: config.image,
         gatewayPort: port,
         gatewayUrl: `ws://127.0.0.1:${port}`,
+        publicUrl: "",
         startedAt: now,
         finishedAt: new Date().toISOString(),
         healthPassed: false,
@@ -135,6 +148,7 @@ export class ShellProvisioner implements Provisioner {
   async remove(tenantId: string): Promise<{ ok: boolean; error?: string }> {
     try {
       await this.exec(`docker rm -f ${shEscape(this.nameFor(tenantId))} >/dev/null 2>&1 || true`);
+      await this.nginx.removeTenant(tenantId);
       this.registry.release(tenantId);
       return { ok: true };
     } catch (err) {
@@ -149,16 +163,18 @@ export class ShellProvisioner implements Provisioner {
     healthy?: boolean;
     containerName?: string;
     allocatedPort?: number;
+    publicUrl?: string;
     error?: string;
   }> {
     const containerName = this.nameFor(tenantId);
     const allocatedPort = this.registry.get(tenantId);
+    const publicUrl = allocatedPort ? this.nginx.gatewayUrl(tenantId) : undefined;
     try {
       const out = await this.exec(
         `docker inspect -f '{{.State.Running}} {{.State.Health.Status}}' ${shEscape(containerName)} 2>/dev/null || true`
       );
       const trimmed = out.trim();
-      if (!trimmed) return { ok: true, exists: false, running: false, containerName, allocatedPort };
+      if (!trimmed) return { ok: true, exists: false, running: false, containerName, allocatedPort, publicUrl };
       const [running, health] = trimmed.split(/\s+/);
       return {
         ok: true,
@@ -167,16 +183,10 @@ export class ShellProvisioner implements Provisioner {
         healthy: health === "healthy" ? true : health === "unhealthy" ? false : undefined,
         containerName,
         allocatedPort,
+        publicUrl,
       };
     } catch (err) {
-      return {
-        ok: false,
-        exists: false,
-        running: false,
-        containerName,
-        allocatedPort,
-        error: err instanceof Error ? err.message : String(err),
-      };
+      return { ok: false, exists: false, running: false, containerName, allocatedPort, publicUrl, error: err instanceof Error ? err.message : String(err) };
     }
   }
 
@@ -192,17 +202,16 @@ export class ShellProvisioner implements Provisioner {
     return false;
   }
 
-  private async waitForGateway(name: string, port: number, timeoutMs: number): Promise<boolean> {
+  // Probe from host — validates port mapping + gateway bind
+  private async waitForGatewayFromHost(port: number, timeoutMs: number): Promise<boolean> {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
       try {
         const out = await this.exec(
-          `docker exec ${shEscape(name)} bash -c '(exec 3<>/dev/tcp/127.0.0.1/${port}) 2>/dev/null && echo ok || echo fail'`
+          `bash -c '(exec 3<>/dev/tcp/127.0.0.1/${port}) 2>/dev/null && echo ok || echo fail'`
         );
         if (out.trim() === "ok") return true;
-      } catch {
-        // not ready yet
-      }
+      } catch { /* not ready */ }
       await this.sleep(1500);
     }
     return false;

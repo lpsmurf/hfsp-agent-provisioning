@@ -31,6 +31,6 @@ fi
 exec openclaw gateway run \
   --force \
   --allow-unconfigured \
-  --bind loopback \
+  --bind lan \
   --port "${GATEWAY_PORT:-18789}" \
   --verbose
