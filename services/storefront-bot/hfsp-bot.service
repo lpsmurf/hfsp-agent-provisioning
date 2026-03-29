@@ -1,0 +1,17 @@
+[Unit]
+Description=HFSP Storefront Bot
+After=network.target docker.service
+
+[Service]
+Type=simple
+User=hfsp
+WorkingDirectory=/home/hfsp/hfsp-agent-provisioning
+Environment=PORT=3001
+ExecStart=/usr/bin/npx ts-node --transpile-only services/storefront-bot/src/index.ts
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
