@@ -669,6 +669,72 @@ app.get('/admin/api/audit-logs', requireAuth, (_req: AuthenticatedRequest, res: 
 });
 
 // GET /admin — serve SPA root
+// ── VPS Nodes API ─────────────────────────────────────────────────────────
+
+// GET /admin/api/nodes
+app.get('/admin/api/nodes', requireAuth, (_req: AuthenticatedRequest, res: Response) => {
+  try {
+    const nodes = db.prepare(`
+      SELECT n.*,
+        (SELECT COUNT(*) FROM tenants t WHERE t.vps_node_id = n.id AND t.status IN ('active','provisioning') AND t.deleted_at IS NULL) as agents_live
+      FROM vps_nodes n ORDER BY n.id
+    `).all();
+    res.json({ ok: true, data: nodes });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: String(err) });
+  }
+});
+
+// POST /admin/api/nodes — add a new VPS node
+app.post('/admin/api/nodes', requireAuth, requireRole('owner'), (req: AuthenticatedRequest, res: Response) => {
+  const { name, host, ssh_user = 'hfsp', ssh_key_path = '', port_range_start = 19000, port_range_end = 19999, capacity_agents_max = 50 } = req.body as any;
+  if (!name || !host) { res.status(400).json({ ok: false, error: 'name and host required' }); return; }
+  try {
+    const result = db.prepare(`
+      INSERT INTO vps_nodes (name, host, ssh_user, ssh_key_path, port_range_start, port_range_end, status, capacity_agents_max)
+      VALUES (?, ?, ?, ?, ?, ?, 'active', ?)
+    `).run(name, host, ssh_user, ssh_key_path, port_range_start, port_range_end, capacity_agents_max);
+    const node = db.prepare('SELECT * FROM vps_nodes WHERE id = ?').get(result.lastInsertRowid);
+    audit(req, 'node.add', 'vps_node', String(result.lastInsertRowid), { name, host });
+    res.json({ ok: true, data: node });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: String(err) });
+  }
+});
+
+// PATCH /admin/api/nodes/:id — update status / capacity
+app.patch('/admin/api/nodes/:id', requireAuth, requireRole('owner'), (req: AuthenticatedRequest, res: Response) => {
+  const id = String(req.params.id);
+  const { status, capacity_agents_max, name } = req.body as any;
+  const allowed = ['active','draining','offline'];
+  if (status && !allowed.includes(status)) { res.status(400).json({ ok: false, error: 'invalid status' }); return; }
+  try {
+    if (status)              db.prepare('UPDATE vps_nodes SET status = ? WHERE id = ?').run(status, id);
+    if (capacity_agents_max) db.prepare('UPDATE vps_nodes SET capacity_agents_max = ? WHERE id = ?').run(capacity_agents_max, id);
+    if (name)                db.prepare('UPDATE vps_nodes SET name = ? WHERE id = ?').run(name, id);
+    const node = db.prepare('SELECT * FROM vps_nodes WHERE id = ?').get(id);
+    audit(req, 'node.update', 'vps_node', id, { status, capacity_agents_max, name });
+    res.json({ ok: true, data: node });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: String(err) });
+  }
+});
+
+// DELETE /admin/api/nodes/:id
+app.delete('/admin/api/nodes/:id', requireAuth, requireRole('owner'), (req: AuthenticatedRequest, res: Response) => {
+  const id = String(req.params.id);
+  if (id === '1') { res.status(400).json({ ok: false, error: 'Cannot remove primary node' }); return; }
+  try {
+    const active = (db.prepare("SELECT COUNT(*) as c FROM tenants WHERE vps_node_id = ? AND status IN ('active','provisioning')").get(id) as any).c;
+    if (active > 0) { res.status(400).json({ ok: false, error: `Node has ${active} active agents — drain first` }); return; }
+    db.prepare('DELETE FROM vps_nodes WHERE id = ?').run(id);
+    audit(req, 'node.remove', 'vps_node', id);
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: String(err) });
+  }
+});
+
 app.get('/admin', (_req: Request, res: Response) => {
   const spa = path.join(__dirname, '../public/index.html');
   res.sendFile(spa);

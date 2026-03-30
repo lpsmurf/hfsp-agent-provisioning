@@ -1553,6 +1553,7 @@ app.post('/telegram/webhook', async (req, res) => {
     const cmd =
       norm === 'create agent' ? 'create' :
       norm === 'my agents' ? 'my_agents' :
+      norm === '/myagents' ? '/myagents' :
       norm === 'help' ? 'help' :
       norm === 'status' ? 'status' :
       norm === 'cancel' ? 'cancel' :
@@ -1567,6 +1568,50 @@ app.post('/telegram/webhook', async (req, res) => {
       clearWizard(telegramUserId);
       await sendMessage(chatId, 'Cancelled. Use the menu buttons when you’re ready.');
       await sendMenu(chatId);
+      return;
+    }
+
+    if (cmd === '/myagents' || cmd === 'my_agents') {
+      const agents = db.prepare(`
+        SELECT tenant_id, agent_name, bot_username, status, model_preset, created_at
+        FROM tenants
+        WHERE telegram_user_id = ? AND (deleted_at IS NULL OR deleted_at = '')
+        ORDER BY created_at DESC
+      `).all(telegramUserId) as any[];
+
+      if (agents.length === 0) {
+        await sendMessage(chatId, "You don't have any agents yet. Tap *Create Agent* to get started.", { parse_mode: 'Markdown' });
+        await sendMenu(chatId);
+        return;
+      }
+
+      for (const a of agents) {
+        const statusEmoji = a.status === 'active' ? '🟢' : a.status === 'stopped' ? '🔴' : '🟡';
+        const modelLabel = a.model_preset === 'smart' ? '🧠 Smart' : '⚡ Fast';
+        const lines = [
+          `${statusEmoji} *@${a.bot_username || a.agent_name}*`,
+          `Status: ${a.status}  |  Model: ${modelLabel}`,
+          `ID: \`${a.tenant_id}\``,
+        ];
+        const keyboard: any[][] = [];
+        if (a.status === 'active') {
+          keyboard.push([
+            { text: '🔄 Change Model', callback_data: `model_change:${a.tenant_id}` },
+            { text: '🗑 Delete', callback_data: `delete_confirm:${a.tenant_id}` },
+          ]);
+        } else if (a.status === 'stopped') {
+          keyboard.push([
+            { text: '▶️ Start', callback_data: `agent_start:${a.tenant_id}` },
+            { text: '🗑 Delete', callback_data: `delete_confirm:${a.tenant_id}` },
+          ]);
+        } else {
+          keyboard.push([{ text: '🗑 Delete', callback_data: `delete_confirm:${a.tenant_id}` }]);
+        }
+        await sendMessage(chatId, lines.join('\n'), {
+          parse_mode: 'Markdown',
+          reply_markup: { inline_keyboard: keyboard },
+        });
+      }
       return;
     }
 
