@@ -97,6 +97,7 @@ function protectWizardData(data: WizardData): WizardData {
   if (out.botToken) out.botToken = encryptString(out.botToken);
   if (out.openaiApiKey) out.openaiApiKey = encryptString(out.openaiApiKey);
   if (out.anthropicApiKey) out.anthropicApiKey = encryptString(out.anthropicApiKey);
+  if (out.openrouterApiKey) out.openrouterApiKey = encryptString(out.openrouterApiKey);
   if (out.lastGatewayToken) out.lastGatewayToken = encryptString(out.lastGatewayToken);
   return out;
 }
@@ -106,6 +107,7 @@ function unprotectWizardData(data: WizardData): WizardData {
   try { if (out.botToken) out.botToken = decryptString(out.botToken); } catch {}
   try { if (out.openaiApiKey) out.openaiApiKey = decryptString(out.openaiApiKey); } catch {}
   try { if (out.anthropicApiKey) out.anthropicApiKey = decryptString(out.anthropicApiKey); } catch {}
+  try { if (out.openrouterApiKey) out.openrouterApiKey = decryptString(out.openrouterApiKey); } catch {}
   try { if (out.lastGatewayToken) out.lastGatewayToken = decryptString(out.lastGatewayToken); } catch {}
   return out;
 }
@@ -215,6 +217,8 @@ type WizardStep =
   | 'await_openai_api_key'
   | 'await_anthropic_api_key'
   | 'await_model_preset'
+  | 'await_openrouter_api_key'
+  | 'await_openrouter_model'
   | 'await_pairing_code'
   | 'await_plan_select'
   | 'await_pay_currency'
@@ -228,7 +232,9 @@ type WizardData = {
   allowTokenReuse?: boolean;
   botUsername?: string; // without @
   templateId?: 'blank' | 'ops_starter';
-  provider?: 'openai' | 'anthropic' | 'other';
+  provider?: 'openai' | 'anthropic' | 'openrouter' | 'other';
+  openrouterApiKey?: string;
+  openrouterModel?: string;
   openaiConnectMethod?: 'oauth_beta' | 'api_key';
   openaiApiKey?: string;
   anthropicApiKey?: string;
@@ -422,6 +428,7 @@ async function renderChooseProvider(chatId: number) {
         inline_keyboard: [
           [{ text: 'OpenAI', callback_data: 'provider:openai' }],
           [{ text: 'Claude (Anthropic)', callback_data: 'provider:anthropic' }],
+          [{ text: '🌐 OpenRouter (300+ models)', callback_data: 'provider:openrouter' }],
           [{ text: 'Others (coming soon)', callback_data: 'provider:others' }],
           [{ text: 'Back', callback_data: 'flow:back' }, { text: 'Cancel', callback_data: 'flow:cancel' }]
         ]
@@ -887,6 +894,21 @@ app.post('/telegram/webhook', async (req, res) => {
         await renderConnectAnthropic(chatId);
         return;
       }
+      if (data === 'provider:openrouter' && w.step === 'choose_provider') {
+        transition(telegramUserId, w.step, 'await_openrouter_api_key', { ...w.data, provider: 'openrouter' });
+        await sendMessage(chatId,
+          [
+            '🌐 *OpenRouter* gives you access to 300+ models from one API key.',
+            '',
+            'Get your key at https://openrouter.ai/keys',
+            '',
+            'Paste your OpenRouter API key:',
+          ].join('\n'),
+          { parse_mode: 'Markdown' }
+        );
+        return;
+      }
+
       if (data === 'provider:others' && w.step === 'choose_provider') {
         setWizard(telegramUserId, 'choose_provider', { ...w.data, provider: 'other' });
         await sendMessage(
@@ -933,6 +955,30 @@ app.post('/telegram/webhook', async (req, res) => {
       }
 
       // Preset selection - generate SSH key and show Provision button
+      if (data?.startsWith('ormodel:') && w.step === 'await_openrouter_model') {
+        const modelId = data.replace('ormodel:', '');
+        if (modelId === 'custom') {
+          await sendMessage(chatId, 'Enter the OpenRouter model ID (e.g. `anthropic/claude-opus-4-5`):',
+            { parse_mode: 'Markdown' });
+          // Stay in await_openrouter_model, next text message will be the model ID
+          setWizard(telegramUserId, 'await_openrouter_model', { ...w.data, openrouterModel: 'custom_pending' });
+          return;
+        }
+        // Model selected — jump to show summary / provision
+        const modelLabel = modelId.split('/').pop() ?? modelId;
+        setWizard(telegramUserId, 'idle', { ...w.data, openrouterModel: modelId, modelPreset: 'smart' });
+        await sendMessage(chatId,
+          `✅ Model: *${modelLabel}*\n\nYour setup is complete. Ready to provision?`,
+          { parse_mode: 'Markdown',
+            reply_markup: { inline_keyboard: [
+              [{ text: '💳 Choose Plan', callback_data: 'plan:select' }],
+              [{ text: 'Cancel', callback_data: 'flow:cancel' }]
+            ]}
+          }
+        );
+        return;
+      }
+
       if (data?.startsWith('preset:') && w.step === 'await_model_preset') {
         const preset = data.split(':')[1];
         const modelPreset = preset === 'fast' ? 'fast' : preset === 'smart' ? 'smart' : undefined;
@@ -1020,7 +1066,7 @@ app.post('/telegram/webhook', async (req, res) => {
           const templateOk = Boolean(w.data.templateId);
           const providerOk = Boolean(w.data.provider);
           const presetOk = Boolean(w.data.modelPreset);
-          const keyOk = Boolean(w.data.openaiApiKey || w.data.anthropicApiKey);
+          const keyOk = Boolean(w.data.openaiApiKey || w.data.anthropicApiKey || w.data.openrouterApiKey);
 
           if (!templateOk || !providerOk || !presetOk || !keyOk) {
             await sendMessage(chatId, 'You\'re missing some setup steps. Tap Status and finish the missing items.');
@@ -1088,6 +1134,10 @@ app.post('/telegram/webhook', async (req, res) => {
           if (w.data.provider === 'openai' && w.data.openaiApiKey) {
             fs.writeFileSync(`${secretsDir}/openai.key`, w.data.openaiApiKey.trim() + '\n', { mode: 0o600 });
           }
+          if (w.data.provider === 'openrouter' && w.data.openrouterApiKey) {
+            // OpenRouter uses OpenAI-compatible API — write as openai.key + set base URL in config
+            fs.writeFileSync(`${secretsDir}/openai.key`, w.data.openrouterApiKey.trim() + '\n', { mode: 0o600 });
+          }
 
           // Copy shared SSH creds required by the container entrypoint
           fs.copyFileSync(`${HFSP_SECRETS_DIR}/ssh_identity`, `${secretsDir}/ssh_identity`);
@@ -1101,7 +1151,10 @@ app.post('/telegram/webhook', async (req, res) => {
           db.prepare(`UPDATE tenants SET gateway_token = ? WHERE tenant_id = ?`).run(encryptString(gatewayToken), tenantId);
 
           // Write tenant openclaw.json
-          const openclawConfig = {
+          const openrouterBaseUrl = w.data.provider === 'openrouter'
+            ? 'https://openrouter.ai/api/v1'
+            : undefined;
+          const openclawConfig: Record<string, unknown> = {
             agents: {
               defaults: { workspace: '/tenant/workspace' },
               list: [{
@@ -1116,7 +1169,9 @@ app.post('/telegram/webhook', async (req, res) => {
               bind: 'lan',
               mode: 'local',
               auth: { mode: 'token', token: gatewayToken },
-              controlUi: { enabled: true }
+              controlUi: { enabled: true },
+              ...(w.data.openrouterModel ? { model: w.data.openrouterModel } : {}),
+              ...(openrouterBaseUrl ? { openaiBaseUrl: openrouterBaseUrl } : {})
             },
             plugins: { entries: { telegram: { enabled: true } } },
             channels: {
@@ -1138,6 +1193,10 @@ app.post('/telegram/webhook', async (req, res) => {
           fs.writeFileSync(configPath, JSON.stringify(openclawConfig, null, 2), { mode: 0o600 });
 
           // Provision container
+          const provisionEnv: Record<string,string> = {};
+          if (w.data.provider === 'openrouter') {
+            provisionEnv['OPENAI_BASE_URL'] = 'https://openrouter.ai/api/v1';
+          }
           const result = await provisioner.provision({
             tenantId,
             image: OPENCLAW_IMAGE,
@@ -1146,6 +1205,7 @@ app.post('/telegram/webhook', async (req, res) => {
             workspacePath: workspaceDir,
             secretsPath: secretsDir,
             configPath,
+            env: provisionEnv,
           });
 
           if (!result.ok) throw new Error(result.error ?? 'Provision failed');
@@ -1298,7 +1358,7 @@ app.post('/telegram/webhook', async (req, res) => {
         }
 
         const botLink = r.bot_username ? `https://t.me/${r.bot_username}` : undefined;
-        const providerLabel = r.provider === 'openai' ? 'OpenAI' : r.provider === 'anthropic' ? 'Claude (Anthropic)' : r.provider ?? '—';
+        const providerLabel = r.provider === 'openai' ? 'OpenAI' : r.provider === 'anthropic' ? 'Claude (Anthropic)' : r.provider === 'openrouter' ? `OpenRouter` : r.provider ?? '—';
 
         const statusLabel = r.status === 'archived' ? 'archived' : r.status === 'stopped' ? 'stopped' : 'active';
 
@@ -1651,7 +1711,7 @@ app.post('/telegram/webhook', async (req, res) => {
 
     if (cmd === 'status') {
       const hasKey = Boolean(w.data.openaiApiKey || w.data.anthropicApiKey);
-      const providerLabel = w.data.provider === 'openai' ? 'OpenAI' : w.data.provider === 'anthropic' ? 'Claude (Anthropic)' : w.data.provider === 'other' ? 'Other' : '—';
+      const providerLabel = w.data.provider === 'openai' ? 'OpenAI' : w.data.provider === 'anthropic' ? 'Claude (Anthropic)' : w.data.provider === 'other' ? 'Other' : w.data.provider === 'openrouter' ? `OpenRouter (${w.data.openrouterModel ?? '—'})` : '—';
       const templateLabel = w.data.templateId === 'blank' ? 'Blank' : w.data.templateId === 'ops_starter' ? 'Ops Starter' : '—';
       const presetLabel = w.data.modelPreset ? (w.data.modelPreset === 'fast' ? 'Fast' : 'Smart') : '—';
 
@@ -1845,6 +1905,8 @@ app.post('/telegram/webhook', async (req, res) => {
       w.step === 'botfather_helper' ||
       w.step === 'await_template' ||
       w.step === 'choose_provider' ||
+      w.step === 'await_openrouter_api_key' ||
+      w.step === 'await_openrouter_model' ||
       w.step === 'connect_openai' ||
       w.step === 'await_model_preset'
     ) {
