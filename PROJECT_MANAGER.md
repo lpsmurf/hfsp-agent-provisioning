@@ -1,83 +1,119 @@
-# HFSP Agent Provisioning — Project Manager
+# HFSP / ClawDrop — Project Manager
+**Last updated:** 2026-03-30  
+**Repo:** `lpsmurf/hfsp-agent-provisioning` (79 commits)
 
-## Current phase
-Phase 3: Scalability & Operations
+---
 
-## Completed phases
+## Current State: Production (Early Access)
 
-### Phase 1 ✅ — OpenClaw runtime proof-of-concept
-- Docker image builds and runs (`hfsp-openclaw-runtime:local`, 1.12 GB)
-- Container lifecycle: provision / stop / remove / status
-- Port registry: auto-allocation 19000–19999, atomic writes
-- Health check: host-side bash TCP probe
-- Parallel tenant test: two containers, unique ports
+| Metric | Value |
+|--------|-------|
+| Users | 2 |
+| Active agents | 1 (`@hfsptest1bot` on PIERCALITO) |
+| VPS nodes | 1 (PIERCALITO, 1/50 slots used) |
+| MRR | $0 (payments built, not gated) |
+| Plans configured | 6 (Starter/Operator/Node × monthly/yearly) |
 
-### Phase 2 ✅ — Telegram bot + full provisioning flow
-- SQLite persistence (`data/storefront.sqlite`): users, tenants, wizard_state
-- Reverse proxy: nginx per-tenant location blocks in `/etc/nginx/conf.d/hfsp-tenants/`
-- Telegram bot (`@hfsp_agent_bot`) — full wizard: template → provider → model → API key → bot token → provision
-- systemd service: `hfsp-bot.service` (port 3001)
-- Health monitor: cron every 5 min, Telegram alerts
-- End-to-end proven: real user created agent, `@hfsptest1bot` responded with Claude Opus 4.6
+---
 
-### Phase 3A ✅ — Capacity guardrails
-- Pre-flight checks in provisioner: refuses if <300 MB RAM or <2 GB disk free
-- Container resource limits: `--memory 512m --memory-swap 512m --cpus 0.75`
-- User-facing error messages: capacity / port exhaustion → friendly Telegram message
-- Monitor extended: memory, disk, port % alerts + dangling Docker image pruning
-- Agent name validation: rejects bot tokens as names, min 2 chars
-- Per-user cap: max 1 active agent enforced at `provision:start`
+## ✅ Phase 1 — OpenClaw Runtime
+- Docker image `hfsp-openclaw-runtime:local` (1.12 GB)
+- Container lifecycle: provision / stop / remove / health check
+- Port registry: atomic allocation 19000–19999
+- Parallel tenant isolation proven
 
-### Phase 3B ✅ — VPS bootstrap script
+## ✅ Phase 2 — Telegram Bot + Provisioning
+- `@hfsp_agent_bot` — full wizard: name → BotFather → provider → API key → model → provision
+- SQLite: users, tenants, wizard_state tables
+- nginx per-tenant reverse proxy (`/ws/{tenantId}`)
+- systemd service (`hfsp-bot.service`, port 3001)
+- Health monitor: cron 5 min, Telegram alerts
+- End-to-end proven: real user → `@hfsptest1bot` → Claude Opus 4.6 responding
+
+## ✅ Phase 3A — Capacity Guardrails
+- Pre-flight: refuses provision if <300 MB RAM or <2 GB disk
+- Container limits: `--memory 512m --cpus 0.75`
+- Agent name validation (rejects bot tokens, min 2 chars)
+- Per-user agent cap enforced at provisioning gate
+
+## ✅ Phase 3B — Bootstrap + Ops Scripts
 - `bootstrap.sh`: fully automated Ubuntu 24.04 VPS setup
-- Parameterized: `--hostname`, `--domain`, `--repo-url`, `--secrets-bundle`
-- Installs: Docker, Node 22, nginx, certbot, sqlite3
-- Creates hfsp user (UID 1002), clones repo, builds image
-- Configures nginx, sudoers, systemd, cron monitor, SQLite DB
+- `scripts/pack-secrets.sh` / `unpack-secrets.sh`: AES-256 encrypted bundle
+- `services/renewal-reminder.sh`: daily cron, Telegram reminders 3 days before expiry
 
-### Phase 3C ✅ — Central admin dashboard
-- `services/admin-dashboard/` — Express + TypeScript, port 3002
-- Token-protected (`~/.openclaw/secrets/admin.token`)
-- Live metrics: memory %, disk %, port slot %
-- Tenant table: agent name, status, container running, CPU %, mem
-- User table: tenant counts, active agents
-- Actions: stop / start / delete tenant containers
-- Auto-refresh every 30 seconds
+## ✅ Phase 3C — Admin Dashboard v2
+- React SPA at `https://agents.hfsp.cloud/admin/`
+- JWT auth (bcrypt + rate-limited login), RBAC (owner/admin/viewer)
+- Audit log on all mutations
+- Pages: Overview, Agents, Users, Billing, Audit Log, VPS Health, **VPS Nodes**
 
-## Current VPS topology
+## ✅ Phase 4 — Multi-VPS + Agent Management
+- `VpsRegistry`: SQLite-backed node registry, `getBestNode()` by load ratio
+- `MultiVpsProvisioner`: local (ShellProvisioner) or SSH-remote provisioning
+- `deprovisioner.ts`: shared stop/delete logic (bot + admin)
+- Bot `/myagents`: list agents, inline delete (2-step confirm), start, change model
+- Model change: fast ↔ smart, docker restart in-place
+- Admin `/admin/#nodes`: add/drain/remove VPS nodes with capacity bars
 
-| Host | IP | Role |
-|------|----|------|
-| PIERCALITO | 72.62.239.63 | Control plane — provisioner, bot, Docker host |
-| IRIS | 187.124.174.137 | Jump box / Vibecoder workspace |
+## ✅ Payments Infrastructure (built, not yet gated)
+- NOWPayments integration: BTC/ETH/SOL/USDC invoices
+- Plans: Starter $19/mo, Operator $49/mo, Node $99/mo (yearly variants)
+- DB: subscriptions, invoices, plans tables live
+- IPN webhook receiver with HMAC-SHA512 verification
+- Subscription manager: activate, renew, expire, guard provisioning
+- **Bot payment wizard NOT YET WIRED** — users can still provision without paying
 
-## PIERCALITO capacity
+---
 
-| Resource | Limit | Alert threshold |
-|---|---|---|
-| Ports | 1,000 (19000–19999) | 80% |
-| Memory | 7.8 GB | <400 MB free |
-| Disk | 96 GB | <3 GB free |
-| CPU | 2 vCPU (AMD EPYC) | No hard limit (per-container 0.75 CPUs) |
+## VPS Topology
 
-## Services running
+| Host | IP | Role | Capacity |
+|------|----|------|----------|
+| PIERCALITO | 72.62.239.63 | Control plane + worker node 1 | 1/50 agents, 16% mem, 14% disk |
+| IRIS | 187.124.174.137 | Jump box / Vibecoder workspace | — |
 
-| Service | Port | Systemd unit |
-|---|---|---|
-| HFSP Storefront Bot | 3001 | hfsp-bot.service |
-| HFSP Admin Dashboard | 3002 | hfsp-admin.service |
-| nginx (agents.hfsp.cloud) | 443/80 | nginx |
+## Services on PIERCALITO
 
-## Next priorities
+| Service | Port | Unit | Status |
+|---------|------|------|--------|
+| HFSP Storefront Bot | 3001 | hfsp-bot.service | ✅ active |
+| HFSP Admin Dashboard | 3002 | hfsp-admin.service | ✅ active |
+| nginx (agents.hfsp.cloud) | 443/80 | nginx | ✅ active |
+| Health monitor | — | cron 5 min | ✅ active |
+| Renewal reminders | — | cron 09:00 UTC | ✅ active |
 
-1. **Multi-VPS provisioner**: extend `ShellProvisioner` to SSH-target remote nodes; add VPS registry
-2. **Secrets bundle workflow**: encrypted tar.gz with all node secrets for fast new VPS setup
-3. **Billing / limits**: track usage per user, enforce plan-based caps (model tier, agent count)
-4. **Tenant deletion flow**: Telegram-initiated delete with confirmation wizard
-5. **Agent upgrade flow**: change model preset without re-provisioning
+---
 
-## What to avoid
-- Webapp wizard (parked)
-- Chrome extension (parked)
-- Trading shell / strategy sandbox (separate concern)
-- Payment flow (future)
+## Next Priorities
+
+### 🔴 P0 — Revenue gate
+**Wire payment wizard into provisioning** — users currently get agents free.
+- Bot patches (plan select → currency → invoice → await payment → provision) were written but never applied due to zsh escaping issue
+- Estimated: 2–3 hours to apply + test
+
+### 🟠 P1 — $GRID tier check (T06)
+- Phantom wallet connect page is built (`/wallet`)
+- Need: $GRID token mint address, tier thresholds
+- Solana RPC via Helius/QuickNode API key
+
+### 🟠 P1 — Second VPS node
+- Bootstrap script is ready (`bootstrap.sh`)
+- Add node via admin `#nodes` page after setup
+- Tests multi-VPS provisioning end-to-end
+
+### 🟡 P2 — Public landing page
+- `hfsp.cloud` root just serves "ok" right now
+- Marketing page for ClawDrop
+
+### 🟡 P2 — Tenant pairing polish
+- Pairing code flow works but UX is rough
+- Add `/pair <code>` shortcut in agent bot
+
+### 🟢 P3 — Agent metrics in bot
+- CPU/memory of your own agent visible via `/myagents`
+- Currently only in admin dashboard
+
+## What's Parked (not being built)
+- Webapp wizard
+- Chrome extension
+- Trading shell / strategy sandbox
