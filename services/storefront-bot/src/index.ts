@@ -8,6 +8,9 @@ import os from 'node:os';
 import { execFileSync } from 'node:child_process';
 import crypto from 'node:crypto';
 import Database from 'better-sqlite3';
+import { createInvoice, verifyIpnSignature, isConfirmed, isFailed } from '../../../src/payments/nowpayments';
+import { PLANS, CURRENCIES, formatPlanCard, getPlan, billingDays } from '../../../src/payments/plans';
+import { SubscriptionManager } from '../../../src/payments/subscription-manager';
 
 const PORT = Number(process.env.PORT ?? 3000);
 const TOKEN_FILE = process.env.TELEGRAM_BOT_TOKEN_FILE ?? '/home/hfsp/.openclaw/secrets/hfsp_agent_bot.token';
@@ -141,6 +144,7 @@ function ensureDir(p: string) {
 
 ensureDir(DB_PATH);
 const db = new Database(DB_PATH);
+const subManager = new SubscriptionManager(db);
 
 db.exec(`
   PRAGMA journal_mode=WAL;
@@ -199,7 +203,10 @@ type WizardStep =
   | 'await_openai_api_key'
   | 'await_anthropic_api_key'
   | 'await_model_preset'
-  | 'await_pairing_code';
+  | 'await_pairing_code'
+  | 'await_plan_select'
+  | 'await_pay_currency'
+  | 'awaiting_payment';
 
 type WizardData = {
   agentName?: string;
@@ -218,6 +225,11 @@ type WizardData = {
   lastDashboardPort?: number;
   lastGatewayToken?: string;
   helpMode?: boolean;
+  planId?: string;
+  payCurrency?: string;
+  subscriptionId?: string;
+  invoiceId?: string;
+  npPaymentId?: string;
   history?: WizardStep[];
 };
 
@@ -268,6 +280,8 @@ type ReplyMarkup = Record<string, unknown>;
 
 type SendMessageOpts = {
   reply_markup?: ReplyMarkup;
+  parse_mode?: string;
+  disable_web_page_preview?: boolean;
 };
 
 async function sendMessage(chatId: number, text: string, opts: SendMessageOpts = {}) {
@@ -546,6 +560,68 @@ app.use(express.json({ limit: '2mb' }));
 
 app.get('/health', (_req, res) => {
   res.status(200).json({ ok: true });
+});
+
+// NOWPayments IPN webhook
+app.post('/payments/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+  try {
+    const sig = (req.headers['x-nowpayments-sig'] as string) ?? '';
+    const rawBody = req.body instanceof Buffer ? req.body.toString('utf8') : JSON.stringify(req.body);
+    if (!verifyIpnSignature(rawBody, sig)) {
+      console.warn('[webhook] Invalid IPN signature');
+      return res.status(401).json({ error: 'invalid signature' });
+    }
+    const payload = JSON.parse(rawBody);
+    console.log('[webhook] IPN:', payload.payment_id, payload.payment_status, payload.order_id);
+
+    // Update invoice
+    const invoiceId = payload.order_id as string;
+    const inv = db.prepare('SELECT * FROM invoices WHERE id = ?').get(invoiceId) as any;
+    if (!inv) {
+      console.warn('[webhook] Invoice not found:', invoiceId);
+      return res.json({ ok: true });
+    }
+    db.prepare(
+      "UPDATE invoices SET nowpayments_status = ?, ipn_payload = ?, updated_at = datetime('now') WHERE id = ?"
+    ).run(payload.payment_status, rawBody, invoiceId);
+
+    if (isConfirmed(payload.payment_status) && inv.subscription_id) {
+      const existing = db.prepare("SELECT * FROM subscriptions WHERE id = ? AND status = 'active'").get(inv.subscription_id) as any;
+      if (!existing) {
+        const sub = subManager.activate(inv.subscription_id);
+        db.prepare("UPDATE invoices SET confirmed_at = datetime('now') WHERE id = ?").run(invoiceId);
+        console.log('[webhook] Subscription activated:', sub.id, 'for user', sub.telegram_user_id);
+        // Notify user
+        try {
+          const plan = getPlan(sub.plan_id);
+          await sendMessage(sub.telegram_user_id, [
+            '\u2705 *Payment confirmed!*',
+            '',
+            'Your *' + plan.name + '* subscription is now active.',
+            'Period: ' + sub.period_start!.slice(0,10) + ' \u2192 ' + sub.period_end!.slice(0,10),
+            '',
+            'Tap below to launch your agent:',
+          ].join('\n'), {
+            parse_mode: 'Markdown',
+            reply_markup: { inline_keyboard: [[{ text: '\ud83d\ude80 Provision Agent', callback_data: 'provision:start' }]] }
+          });
+        } catch (e) {
+          console.error('[webhook] Failed to notify user:', e);
+        }
+      }
+    } else if (isFailed(payload.payment_status) && inv.subscription_id) {
+      console.log('[webhook] Payment failed/expired for invoice:', invoiceId);
+      try {
+        await sendMessage(inv.telegram_user_id,
+          '\u274c Payment ' + payload.payment_status + ' for invoice ' + invoiceId + '. Use /start to try again.'
+        );
+      } catch {}
+    }
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('[webhook] Error:', err);
+    res.status(500).json({ error: 'internal error' });
+  }
 });
 
 app.post('/telegram/webhook', async (req, res) => {
@@ -883,7 +959,7 @@ app.post('/telegram/webhook', async (req, res) => {
             {
               reply_markup: {
                 inline_keyboard: [
-                  [{ text: '🚀 Provision Agent', callback_data: 'provision:start' }],
+                  [{ text: '💳 Choose Plan', callback_data: 'plan:select' }],
                   [{ text: 'Cancel', callback_data: 'flow:cancel' }]
                 ]
               }
@@ -894,7 +970,7 @@ app.post('/telegram/webhook', async (req, res) => {
           await sendMessage(chatId, '⚠️ Key generation failed. Continue anyway?', {
             reply_markup: {
               inline_keyboard: [
-                [{ text: '🚀 Provision Agent', callback_data: 'provision:start' }],
+                [{ text: '💳 Choose Plan', callback_data: 'plan:select' }],
                 [{ text: 'Cancel', callback_data: 'flow:cancel' }]
               ]
             }
@@ -906,18 +982,23 @@ app.post('/telegram/webhook', async (req, res) => {
 
       // Provision: create tenant + start container
       if (data === 'provision:start' || data === 'provision:retry') {
-        // Per-user agent cap
+        // Subscription + per-plan agent cap guard
         if (data === 'provision:start') {
-          const MAX_AGENTS_PER_USER = 1;
-          const capRow = db.prepare(
-            "SELECT COUNT(*) as cnt FROM tenants WHERE telegram_user_id = ? AND status IN ('active','provisioning','stopped') AND deleted_at IS NULL"
-          ).get(telegramUserId) as any;
-          const activeCount = capRow?.cnt ?? 0;
-          if (activeCount >= MAX_AGENTS_PER_USER) {
-            await sendMessage(chatId,
-              `You already have ${activeCount} active agent. Delete it first before creating a new one.`,
-              { reply_markup: { inline_keyboard: [[{ text: 'My Agents', callback_data: 'list_agents' }]] } }
-            );
+          const check = subManager.canProvision(telegramUserId);
+          if (!check.allowed) {
+            if (check.reason === 'no_subscription') {
+              await sendMessage(chatId,
+                '\ud83d\udd12 You need an active subscription to provision an agent.',
+                { reply_markup: { inline_keyboard: [[{ text: '\ud83d\udcb3 Choose Plan', callback_data: 'plan:select' }]] } }
+              );
+            } else if (check.reason === 'agent_limit') {
+              const planName = check.plan?.name ?? 'your';
+              const maxA = check.plan?.maxAgents ?? 0;
+              await sendMessage(chatId,
+                'You have reached the agent limit for your ' + planName + ' plan (' + maxA + ' agent' + (maxA > 1 ? 's' : '') + '). Upgrade to add more.',
+                { reply_markup: { inline_keyboard: [[{ text: '\u2b06\ufe0f Upgrade Plan', callback_data: 'plan:select' }]] } }
+              );
+            }
             return;
           }
         }
@@ -1555,7 +1636,7 @@ app.post('/telegram/webhook', async (req, res) => {
       }
 
       if (lastFailed?.tenant_id) inline.push([{ text: 'Retry provisioning', callback_data: 'provision:retry' }]);
-      inline.push([{ text: 'Provision agent', callback_data: 'provision:start' }]);
+      inline.push([{ text: '💳 Choose Plan', callback_data: 'plan:select' }]);
       inline.push([{ text: 'Back', callback_data: 'flow:back' }, { text: 'Cancel', callback_data: 'flow:cancel' }]);
 
       await sendMessage(chatId, statusLines.join('\n'), {
