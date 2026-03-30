@@ -11,6 +11,7 @@ import Database from 'better-sqlite3';
 import { createInvoice, verifyIpnSignature, isConfirmed, isFailed } from '../../../src/payments/nowpayments';
 import { PLANS, CURRENCIES, formatPlanCard, getPlan, billingDays } from '../../../src/payments/plans';
 import { SubscriptionManager } from '../../../src/payments/subscription-manager';
+import { getGridTier, formatTierSummary } from '../../../src/solana/grid-tier';
 
 const PORT = Number(process.env.PORT ?? 3000);
 const TOKEN_FILE = process.env.TELEGRAM_BOT_TOKEN_FILE ?? '/home/hfsp/.openclaw/secrets/hfsp_agent_bot.token';
@@ -145,6 +146,17 @@ function ensureDir(p: string) {
 ensureDir(DB_PATH);
 const db = new Database(DB_PATH);
 const subManager = new SubscriptionManager(db);
+
+// Wallet connect one-time tokens
+db.exec(`
+  CREATE TABLE IF NOT EXISTS wallet_tokens (
+    token      TEXT PRIMARY KEY,
+    telegram_user_id INTEGER NOT NULL,
+    used       INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    expires_at TEXT NOT NULL DEFAULT (datetime('now', '+10 minutes'))
+  )
+`);
 
 db.exec(`
   PRAGMA journal_mode=WAL;
@@ -1885,6 +1897,64 @@ app.post('/telegram/webhook', async (req, res) => {
   } catch (err) {
     console.error('Webhook handler error', err);
   }
+});
+
+// ── Wallet connect routes ────────────────────────────────────────────────────
+import path_mod from 'node:path';
+
+app.get('/wallet', (_req, res) => {
+  res.sendFile(path_mod.join(process.cwd(), 'services/storefront-bot/public/wallet-connect.html'));
+});
+
+app.get('/wallet/tier', async (req, res) => {
+  const wallet = req.query.wallet as string;
+  if (!wallet) return res.status(400).json({ error: 'missing wallet' });
+  try {
+    const result = await getGridTier(wallet);
+    res.json(result);
+  } catch (e) {
+    res.status(500).json({ error: (e as Error).message });
+  }
+});
+
+app.post('/wallet/verify', async (req, res) => {
+  const { token, wallet } = req.body as { token?: string; wallet?: string };
+  if (!token || !wallet) return res.status(400).json({ error: 'missing token or wallet' });
+
+  const row = db.prepare(
+    "SELECT * FROM wallet_tokens WHERE token = ? AND used = 0 AND expires_at > datetime('now')"
+  ).get(token) as any;
+  if (!row) return res.status(401).json({ error: 'invalid or expired token' });
+
+  // Mark token used
+  db.prepare("UPDATE wallet_tokens SET used = 1 WHERE token = ?").run(token);
+
+  // Check $GRID tier
+  let tierResult;
+  try { tierResult = await getGridTier(wallet); } catch { tierResult = null; }
+
+  // Save wallet to user
+  db.prepare(
+    "UPDATE users SET solana_wallet = ?, grid_balance = ?, grid_tier = ?, wallet_verified_at = datetime('now') WHERE telegram_user_id = ?"
+  ).run(wallet, tierResult?.balance ?? 0, tierResult?.tier ?? 'none', row.telegram_user_id);
+
+  // Notify user in Telegram
+  try {
+    const tierMsg = tierResult ? formatTierSummary(tierResult) : '';
+    await sendMessage(row.telegram_user_id,
+      '\u2705 *Wallet connected!*\n\n' +
+      '`' + wallet + '`\n\n' +
+      tierMsg,
+      { parse_mode: 'Markdown' }
+    );
+  } catch {}
+
+  res.json({
+    ok: true,
+    tier: tierResult?.tier,
+    tierLabel: tierResult?.label,
+    tierEmoji: tierResult?.emoji,
+  });
 });
 
 app.listen(PORT, '127.0.0.1', () => {

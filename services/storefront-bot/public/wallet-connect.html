@@ -1,0 +1,243 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Connect Wallet — ClawDrop</title>
+  <style>
+    :root {
+      --bg: #0d0d14;
+      --card: #16161f;
+      --border: #2a2a3a;
+      --accent: #7c5cfc;
+      --accent2: #4fd1c5;
+      --text: #e8e8f0;
+      --muted: #6b6b8a;
+      --success: #48bb78;
+      --error: #fc5c7d;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 1.5rem;
+    }
+    .card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 1.25rem;
+      padding: 2.5rem 2rem;
+      max-width: 420px;
+      width: 100%;
+      text-align: center;
+    }
+    .logo { font-size: 2.5rem; margin-bottom: 0.75rem; }
+    h1 { font-size: 1.4rem; font-weight: 700; margin-bottom: 0.4rem; }
+    .sub { color: var(--muted); font-size: 0.9rem; margin-bottom: 2rem; line-height: 1.5; }
+    .btn {
+      display: flex; align-items: center; justify-content: center; gap: 0.6rem;
+      width: 100%; padding: 0.85rem 1.5rem;
+      border: none; border-radius: 0.75rem;
+      font-size: 1rem; font-weight: 600; cursor: pointer;
+      transition: opacity 0.15s, transform 0.1s;
+    }
+    .btn:hover { opacity: 0.9; transform: translateY(-1px); }
+    .btn:active { transform: translateY(0); }
+    .btn:disabled { opacity: 0.4; cursor: not-allowed; transform: none; }
+    .btn-phantom {
+      background: linear-gradient(135deg, #ab9ff2, #7c5cfc);
+      color: #fff;
+    }
+    .btn-secondary {
+      background: var(--border);
+      color: var(--text);
+      margin-top: 0.75rem;
+      font-size: 0.85rem;
+    }
+    .wallet-info {
+      background: rgba(127,92,252,0.08);
+      border: 1px solid rgba(127,92,252,0.25);
+      border-radius: 0.75rem;
+      padding: 1rem;
+      margin: 1.25rem 0;
+      text-align: left;
+    }
+    .wallet-info .label { color: var(--muted); font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em; }
+    .wallet-info .value { font-family: monospace; font-size: 0.85rem; word-break: break-all; margin-top: 0.2rem; }
+    .tier-badge {
+      display: inline-flex; align-items: center; gap: 0.4rem;
+      padding: 0.3rem 0.75rem;
+      border-radius: 99px;
+      font-size: 0.85rem; font-weight: 600;
+      background: linear-gradient(135deg, #7c5cfc22, #4fd1c522);
+      border: 1px solid #7c5cfc44;
+      margin-top: 0.5rem;
+    }
+    .status {
+      margin: 1rem 0;
+      padding: 0.75rem 1rem;
+      border-radius: 0.5rem;
+      font-size: 0.875rem;
+    }
+    .status.info  { background: rgba(79,209,197,0.1); border: 1px solid rgba(79,209,197,0.3); color: var(--accent2); }
+    .status.ok    { background: rgba(72,187,120,0.1); border: 1px solid rgba(72,187,120,0.3); color: var(--success); }
+    .status.error { background: rgba(252,92,125,0.1); border: 1px solid rgba(252,92,125,0.3); color: var(--error); }
+    .divider { border: none; border-top: 1px solid var(--border); margin: 1.5rem 0; }
+    .phantom-logo { width: 22px; height: 22px; }
+    #no-phantom { display: none; }
+    a { color: var(--accent2); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+  </style>
+</head>
+<body>
+<div class="card">
+  <div class="logo">🔗</div>
+  <h1>Connect Wallet</h1>
+  <p class="sub">Connect your Phantom wallet to verify your $GRID balance and unlock your tier.</p>
+
+  <div id="status-box" class="status info" style="display:none"></div>
+
+  <!-- Step 1: connect -->
+  <div id="step-connect">
+    <button class="btn btn-phantom" id="btn-connect" onclick="connectPhantom()">
+      <svg class="phantom-logo" viewBox="0 0 128 128" fill="none" xmlns="http://www.w3.org/2000/svg">
+        <rect width="128" height="128" rx="28" fill="url(#phantom_grad)"/>
+        <path d="M110.584 64.356c0 24.976-21.553 45.22-48.138 45.22-26.585 0-48.138-20.244-48.138-45.22 0-24.976 21.553-45.22 48.138-45.22 26.585 0 48.138 20.244 48.138 45.22z" fill="#fff" fill-opacity=".15"/>
+        <path d="M93.29 55.05H81.4c0-9.58-8.054-17.35-17.994-17.35-9.94 0-17.994 7.77-17.994 17.35 0 4.03 1.438 7.73 3.81 10.65l-9.11 9.07a31.74 31.74 0 01-8.446-21.72C31.666 36.47 46.805 22 65.406 22c18.6 0 33.74 14.47 33.74 32.32 0 .18-.018.36-.018.52l-5.837.21z" fill="#fff"/>
+        <path d="M93.29 55.05c0 .18-.018.36-.018.52L87.436 55.78c0-.243.009-.485.009-.73H93.29z" fill="#fff" fill-opacity=".5"/>
+        <path d="M58.69 80.16c-3.55-1.56-6.62-4.05-8.875-7.26l9.11-9.07c1.575 2.06 3.87 3.47 6.48 3.47 4.41 0 7.994-3.47 7.994-7.74V55.05H87.4v4.51c0 13.55-12.877 20.6-28.71 20.6z" fill="#fff"/>
+        <defs>
+          <linearGradient id="phantom_grad" x1="0" y1="0" x2="128" y2="128" gradientUnits="userSpaceOnUse">
+            <stop stop-color="#534BB1"/>
+            <stop offset="1" stop-color="#551BF9"/>
+          </linearGradient>
+        </defs>
+      </svg>
+      Connect Phantom
+    </button>
+
+    <div id="no-phantom" style="display:none; margin-top:1rem">
+      <p style="color:var(--muted); font-size:0.85rem; margin-bottom:0.75rem">
+        Phantom extension not detected.
+      </p>
+      <a href="https://phantom.app" target="_blank" class="btn btn-secondary" style="text-decoration:none; display:flex; align-items:center; justify-content:center; gap:0.5rem">
+        ↗ Install Phantom
+      </a>
+    </div>
+  </div>
+
+  <!-- Step 2: connected, show wallet + confirm -->
+  <div id="step-confirm" style="display:none">
+    <div class="wallet-info">
+      <div class="label">Connected wallet</div>
+      <div class="value" id="wallet-address"></div>
+      <div id="tier-display" style="margin-top:0.5rem"></div>
+    </div>
+    <button class="btn btn-phantom" id="btn-confirm" onclick="confirmWallet()">
+      ✓ Confirm &amp; Link to Account
+    </button>
+    <button class="btn btn-secondary" onclick="resetConnect()">Disconnect</button>
+  </div>
+
+  <!-- Step 3: done -->
+  <div id="step-done" style="display:none">
+    <div class="status ok" style="display:block; margin-bottom:1.25rem">
+      ✅ Wallet linked successfully! Head back to Telegram.
+    </div>
+    <div class="wallet-info" id="done-info"></div>
+  </div>
+</div>
+
+<script>
+const params = new URLSearchParams(window.location.search);
+const TOKEN = params.get('token') || '';
+const API_BASE = window.location.origin;
+
+function showStatus(msg, type = 'info') {
+  const el = document.getElementById('status-box');
+  el.className = 'status ' + type;
+  el.textContent = msg;
+  el.style.display = 'block';
+}
+function hideStatus() { document.getElementById('status-box').style.display = 'none'; }
+
+let connectedWallet = null;
+
+async function connectPhantom() {
+  const provider = window.phantom?.solana;
+  if (!provider?.isPhantom) {
+    document.getElementById('no-phantom').style.display = 'block';
+    return;
+  }
+  document.getElementById('btn-connect').disabled = true;
+  showStatus('Waiting for Phantom approval…', 'info');
+  try {
+    const res = await provider.connect();
+    connectedWallet = res.publicKey.toString();
+    document.getElementById('wallet-address').textContent = connectedWallet;
+    showStatus('Fetching $GRID balance…', 'info');
+
+    // Ask backend for tier info
+    let tierHtml = '';
+    try {
+      const r = await fetch(`${API_BASE}/wallet/tier?wallet=${encodeURIComponent(connectedWallet)}`);
+      const data = await r.json();
+      if (data.mintConfigured) {
+        tierHtml = `<div class="tier-badge">${data.emoji} ${data.label} — ${data.balance.toLocaleString()} $GRID</div>`;
+      } else {
+        tierHtml = `<div class="tier-badge">👀 $GRID tier pending configuration</div>`;
+      }
+    } catch (e) {
+      tierHtml = `<div class="tier-badge">👀 Balance check unavailable</div>`;
+    }
+    document.getElementById('tier-display').innerHTML = tierHtml;
+
+    hideStatus();
+    document.getElementById('step-connect').style.display = 'none';
+    document.getElementById('step-confirm').style.display = 'block';
+  } catch (err) {
+    showStatus(err.code === 4001 ? 'Connection rejected.' : 'Error: ' + err.message, 'error');
+    document.getElementById('btn-connect').disabled = false;
+  }
+}
+
+async function confirmWallet() {
+  if (!connectedWallet) return;
+  if (!TOKEN) { showStatus('Missing session token. Return to Telegram and try again.', 'error'); return; }
+  document.getElementById('btn-confirm').disabled = true;
+  showStatus('Linking wallet…', 'info');
+  try {
+    const res = await fetch(`${API_BASE}/wallet/verify`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token: TOKEN, wallet: connectedWallet }),
+    });
+    const data = await res.json();
+    if (!data.ok) throw new Error(data.error || 'Unknown error');
+    hideStatus();
+    document.getElementById('step-confirm').style.display = 'none';
+    document.getElementById('step-done').style.display = 'block';
+    document.getElementById('done-info').innerHTML =
+      `<div class="label">Wallet</div><div class="value">${connectedWallet}</div>` +
+      (data.tier ? `<div class="tier-badge" style="margin-top:.5rem">${data.tierEmoji} ${data.tierLabel} tier</div>` : '');
+  } catch (err) {
+    showStatus('Failed: ' + err.message, 'error');
+    document.getElementById('btn-confirm').disabled = false;
+  }
+}
+
+function resetConnect() {
+  connectedWallet = null;
+  document.getElementById('step-confirm').style.display = 'none';
+  document.getElementById('step-connect').style.display = 'block';
+  document.getElementById('btn-connect').disabled = false;
+  hideStatus();
+}
+</script>
+</body>
+</html>
