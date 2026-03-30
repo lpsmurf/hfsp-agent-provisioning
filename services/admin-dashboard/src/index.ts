@@ -413,7 +413,17 @@ app.get('/admin/api/overview', requireAuth, (_req: AuthenticatedRequest, res: Re
     const { mrr, arr } = calcMrrArr();
     const vps = getCapacity();
 
-    res.json({ ok: true, data: { users, tenants, activeAgents, mrrUsd: mrr, arrUsd: arr, activeSubs, vps } });
+    const recentAgents = db.prepare(
+      "SELECT tenant_id, agent_name, telegram_user_id, status, created_at FROM tenants ORDER BY created_at DESC LIMIT 5"
+    ).all();
+    // Flatten vps fields so SPA can read them directly off ov.vps.*
+    const vpsFlat = {
+      memTotalMb: vps.memTotalMb, memAvailMb: vps.memAvailMb, memUsedPct: vps.memUsedPct,
+      diskTotalGb: vps.diskTotalGb, diskUsedGb: vps.diskUsedGb, diskAvailGb: vps.diskAvailGb, diskUsedPct: vps.diskUsedPct,
+      portsUsed: Object.keys(vps.portRegistry).length, portsTotal: 1000,
+      portsUsedPct: Math.round(Object.keys(vps.portRegistry).length / 10),
+    };
+    res.json({ ok: true, data: { users, tenants, activeAgents, mrrUsd: mrr, arrUsd: arr, activeSubs, vps: vpsFlat, recentAgents } });
   } catch (err) {
     res.status(500).json({ ok: false, error: String(err) });
   }
@@ -432,7 +442,15 @@ app.get('/admin/api/vps', requireAuth, (_req: AuthenticatedRequest, res: Respons
       // ignore
     }
 
-    res.json({ ok: true, data: { hostname, capacity, dockerStats } });
+    const c = capacity;
+    res.json({ ok: true, data: {
+      hostname,
+      memTotalMb: c.memTotalMb, memAvailMb: c.memAvailMb, memUsedPct: c.memUsedPct,
+      diskTotalGb: c.diskTotalGb, diskUsedGb: c.diskUsedGb, diskAvailGb: c.diskAvailGb, diskUsedPct: c.diskUsedPct,
+      portsUsed: Object.keys(c.portRegistry).length, portsTotal: 1000,
+      portsUsedPct: Math.round(Object.keys(c.portRegistry).length / 10),
+      dockerStats,
+    } });
   } catch (err) {
     res.status(500).json({ ok: false, error: String(err) });
   }

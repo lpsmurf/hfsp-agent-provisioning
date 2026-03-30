@@ -108,7 +108,7 @@ function useApi(url, deps = []) {
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
         return r.json();
       })
-      .then(d => { if (!cancelled) { setData(d); setLoading(false); } })
+      .then(d => { if (!cancelled) { setData(d?.data ?? d); setLoading(false); } })
       .catch(e => { if (!cancelled) { setError(e.message); setLoading(false); } });
     return () => { cancelled = true; };
   // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -340,7 +340,7 @@ function OverviewPage() {
     return () => clearInterval(t);
   }, []);
 
-  const agents = ov?.recent_agents || ov?.tenants?.slice(0,5) || [];
+  const agents = ov?.recentAgents || [];
 
   return h('div', null,
     h(PageHeader, { title: 'Overview', onRefresh: refresh }),
@@ -352,11 +352,11 @@ function OverviewPage() {
         : eOv
           ? h('div',{className:'col-span-5'},h(ErrorBox,{message:eOv,onRetry:rOv}))
           : [
-              h(StatCard,{key:'users',label:'Users',value:(ov?.user_count??ov?.users_count??'—').toLocaleString?.()??'—'}),
-              h(StatCard,{key:'agents',label:'Active Agents',value:(ov?.active_agents??ov?.active_tenants??'—').toLocaleString?.()??'—'}),
-              h(StatCard,{key:'mrr',label:'MRR',value:fmtMoney(ov?.mrr)}),
-              h(StatCard,{key:'arr',label:'ARR',value:fmtMoney(ov?.arr)}),
-              h(StatCard,{key:'subs',label:'Active Subs',value:(ov?.active_subscriptions??ov?.active_subs??'—').toLocaleString?.()??'—'}),
+              h(StatCard,{key:'users',label:'Users',value:(ov?.users??'—').toLocaleString?.()??'—'}),
+              h(StatCard,{key:'agents',label:'Active Agents',value:(ov?.activeAgents??'—').toLocaleString?.()??'—'}),
+              h(StatCard,{key:'mrr',label:'MRR',value:fmtMoney(ov?.mrrUsd)}),
+              h(StatCard,{key:'arr',label:'ARR',value:fmtMoney(ov?.arrUsd)}),
+              h(StatCard,{key:'subs',label:'Active Subs',value:(ov?.activeSubs??'—').toLocaleString?.()??'—'}),
             ]
     ),
 
@@ -368,9 +368,9 @@ function OverviewPage() {
         : eVps
           ? h(ErrorBox,{message:eVps,onRetry:rVps})
           : h('div', { className: 'grid grid-cols-1 md:grid-cols-3 gap-6' },
-              h(ProgressBar,{label:'Memory',pct:vps?.memory_pct??((vps?.memory_used_mb/vps?.memory_total_mb||0)*100),sub:`${vps?.memory_used_mb||0} / ${vps?.memory_total_mb||0} MB`}),
-              h(ProgressBar,{label:'Disk',pct:vps?.disk_pct??((vps?.disk_used_gb/vps?.disk_total_gb||0)*100),sub:`${vps?.disk_used_gb||0} / ${vps?.disk_total_gb||0} GB`}),
-              h(ProgressBar,{label:'Ports',pct:vps?.ports_pct??((vps?.ports_used/vps?.ports_total||0)*100),sub:`${vps?.ports_used||0} / ${vps?.ports_total||0} ports`})
+              h(ProgressBar,{label:'Memory',pct:vps?.memUsedPct ?? vps?.capacity?.memory?.usedPct||0,sub:`${(vps?.memTotalMb ?? vps?.capacity?.memory?.totalMb ?? 0)-(vps?.memAvailMb ?? vps?.capacity?.memory?.availMb ?? 0)} / ${vps?.memTotalMb ?? vps?.capacity?.memory?.totalMb ?? 0} MB`}),
+              h(ProgressBar,{label:'Disk',pct:vps?.diskUsedPct ?? vps?.capacity?.disk?.usedPct ?? 0,sub:`${vps?.diskUsedGb ?? vps?.capacity?.disk?.usedGb ?? 0} / ${vps?.diskTotalGb ?? vps?.capacity?.disk?.totalGb ?? 0} GB`}),
+              h(ProgressBar,{label:'Ports',pct:vps?.portsUsedPct ?? vps?.capacity?.ports?.usedPct ?? 0,sub:`${vps?.portsUsed ?? vps?.capacity?.ports?.used ?? 0} / ${vps?.portsTotal ?? vps?.capacity?.ports?.total ?? 0} ports`})
             )
     ),
 
@@ -405,7 +405,7 @@ function AgentsPage() {
 
   const STATUS_TABS = ['All','Active','Provisioning','Stopped','Failed','Deleted'];
 
-  const filtered = (data?.tenants || data || []).filter(a => {
+  const filtered = (Array.isArray(data) ? data : (data?.tenants || [])).filter(a => {
     const q = search.toLowerCase();
     const matchQ = !q || (a.tenant_id||'').toLowerCase().includes(q)
       || (a.agent_name||'').toLowerCase().includes(q)
@@ -520,7 +520,7 @@ function UsersPage() {
   const { data, loading, error, refresh } = useApi('/admin/api/users');
   const [search, setSearch] = useState('');
 
-  const users = data?.users || data || [];
+  const users = Array.isArray(data) ? data : (data?.users || []);
   const filtered = users.filter(u =>
     !search || String(u.user_id||u.telegram_user_id||u.id||'').includes(search) ||
     (u.email||'').toLowerCase().includes(search.toLowerCase())
@@ -590,7 +590,7 @@ function BillingPage() {
             h(Tr, { key: s.id||s.subscription_id||i },
               h(Td, null, h('code',{className:'text-xs text-purple-300'},s.user_id||s.telegram_user_id||'—')),
               h(Td, null, h('span',{className:'text-gray-200 text-sm'},s.plan||s.plan_name||'—')),
-              h(Td, null, h('span',{className:'text-gray-400 text-xs capitalize'},s.billing_interval||s.interval||'—')),
+              h(Td, null, h('span',{className:'text-gray-400 text-xs capitalize'},s.plan_id?.includes('yearly') ? 'yearly' : 'monthly')),
               h(Td, null, h(StatusBadge,{status:s.status})),
               h(Td, null, h('span',{className:'text-gray-500 text-xs'},fmtDate(s.current_period_end||s.period_end))),
               h(Td, null, h('span',{className:'text-gray-500 text-xs'},fmtDate(s.created_at)))
