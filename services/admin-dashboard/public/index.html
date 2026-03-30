@@ -1,0 +1,798 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>HFSP / ClawDrop — Admin</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    body { background: #0d0d14; font-family: system-ui, -apple-system, sans-serif; }
+    ::-webkit-scrollbar { width: 6px; height: 6px; }
+    ::-webkit-scrollbar-track { background: #0d0d14; }
+    ::-webkit-scrollbar-thumb { background: #2a2a3e; border-radius: 3px; }
+    .sidebar-bg { background: #0a0a12; border-right: 1px solid #1e1e2e; }
+    .card-bg { background: #12121c; border: 1px solid #1e1e2e; }
+    @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.4} }
+    .skeleton { animation: pulse 1.5s ease-in-out infinite; background: #1e1e2e; border-radius: 4px; }
+  </style>
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          colors: {
+            surface: '#0d0d14',
+            card: '#12121c',
+            border: '#1e1e2e',
+            accent: '#7c3aed',
+            'accent-light': '#a78bfa',
+          }
+        }
+      }
+    }
+  </script>
+</head>
+<body class="text-gray-100 min-h-screen">
+<script type="module">
+import { createElement as h, useState, useEffect, useContext, createContext, useCallback, useRef } from 'https://esm.sh/react@18';
+import { createRoot } from 'https://esm.sh/react-dom@18/client';
+
+// ─── Auth Context ───────────────────────────────────────────────────────────
+const AuthContext = createContext(null);
+
+function AuthProvider({ children }) {
+  const [token, setToken] = useState(() => localStorage.getItem('hfsp_admin_token'));
+  const [user, setUser] = useState(null);
+  const [checking, setChecking] = useState(true);
+
+  useEffect(() => {
+    if (!token) { setChecking(false); return; }
+    fetch('/admin/auth/me', { headers: { Authorization: 'Bearer ' + token } })
+      .then(r => { if (!r.ok) throw new Error('401'); return r.json(); })
+      .then(u => { setUser(u); setChecking(false); })
+      .catch(() => { localStorage.removeItem('hfsp_admin_token'); setToken(null); setChecking(false); });
+  }, [token]);
+
+  const login = async (email, password) => {
+    const r = await fetch('/admin/auth/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email, password }),
+    });
+    if (!r.ok) { const e = await r.json().catch(() => ({})); throw new Error(e.message || 'Login failed'); }
+    const { token: t, user: u } = await r.json();
+    localStorage.setItem('hfsp_admin_token', t);
+    setToken(t);
+    setUser(u);
+  };
+
+  const logout = () => {
+    localStorage.removeItem('hfsp_admin_token');
+    setToken(null);
+    setUser(null);
+  };
+
+  return h(AuthContext.Provider, { value: { token, user, login, logout, checking } }, children);
+}
+
+// ─── Hooks ───────────────────────────────────────────────────────────────────
+function useAuth() { return useContext(AuthContext); }
+
+function useHash() {
+  const [hash, setHash] = useState(() => location.hash || '#overview');
+  useEffect(() => {
+    const h = () => setHash(location.hash || '#overview');
+    window.addEventListener('hashchange', h);
+    return () => window.removeEventListener('hashchange', h);
+  }, []);
+  return hash;
+}
+
+function useApi(url, deps = []) {
+  const { token, logout } = useAuth();
+  const [data, setData] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+  const [rev, setRev] = useState(0);
+
+  const refresh = useCallback(() => setRev(r => r + 1), []);
+
+  useEffect(() => {
+    if (!url || !token) return;
+    let cancelled = false;
+    setLoading(true);
+    setError(null);
+    fetch(url, { headers: { Authorization: 'Bearer ' + token } })
+      .then(r => {
+        if (r.status === 401) { logout(); throw new Error('Unauthorized'); }
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        return r.json();
+      })
+      .then(d => { if (!cancelled) { setData(d); setLoading(false); } })
+      .catch(e => { if (!cancelled) { setError(e.message); setLoading(false); } });
+    return () => { cancelled = true; };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [url, token, rev, ...deps]);
+
+  return { data, loading, error, refresh };
+}
+
+// ─── Utilities ───────────────────────────────────────────────────────────────
+const fmtMoney = v => '$' + (v || 0).toLocaleString('en-US', { minimumFractionDigits: 0 });
+const fmtDate = s => s ? s.slice(0, 16).replace('T', ' ') : '—';
+const truncateId = id => id && id.length > 16 ? id.slice(0, 16) + '…' : (id || '—');
+
+// ─── Status Badges ────────────────────────────────────────────────────────────
+function StatusBadge({ status }) {
+  const map = {
+    active:        'bg-green-900/60 text-green-300 border border-green-700/40',
+    provisioning:  'bg-blue-900/60 text-blue-300 border border-blue-700/40',
+    stopped:       'bg-yellow-900/60 text-yellow-300 border border-yellow-700/40',
+    failed:        'bg-red-900/60 text-red-300 border border-red-700/40',
+    error:         'bg-red-900/60 text-red-300 border border-red-700/40',
+    deleted:       'bg-gray-800/60 text-gray-400 border border-gray-600/40',
+    paid:          'bg-green-900/60 text-green-300 border border-green-700/40',
+    open:          'bg-blue-900/60 text-blue-300 border border-blue-700/40',
+    void:          'bg-gray-800/60 text-gray-400 border border-gray-600/40',
+    uncollectible: 'bg-red-900/60 text-red-300 border border-red-700/40',
+    canceled:      'bg-gray-800/60 text-gray-400 border border-gray-600/40',
+    trialing:      'bg-purple-900/60 text-purple-300 border border-purple-700/40',
+    past_due:      'bg-red-900/60 text-red-300 border border-red-700/40',
+    incomplete:    'bg-yellow-900/60 text-yellow-300 border border-yellow-700/40',
+  };
+  const cls = map[status?.toLowerCase()] || 'bg-gray-800/60 text-gray-400 border border-gray-600/40';
+  return h('span', { className: `inline-flex items-center px-2 py-0.5 rounded text-xs font-medium ${cls}` }, status || '—');
+}
+
+function ContainerBadge({ running }) {
+  if (running === undefined || running === null) return h('span', { className: 'text-gray-600 text-xs' }, '—');
+  return running
+    ? h('span', { className: 'inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs font-medium bg-green-900/60 text-green-300 border border-green-700/40' },
+        h('span', null, '▶'), 'running')
+    : h('span', { className: 'inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs font-medium bg-gray-800/60 text-gray-400 border border-gray-600/40' },
+        h('span', null, '■'), 'down');
+}
+
+// ─── Progress Bar ─────────────────────────────────────────────────────────────
+function ProgressBar({ pct, label, sub }) {
+  const color = pct >= 80 ? 'bg-red-500' : pct >= 60 ? 'bg-yellow-500' : 'bg-green-500';
+  const textColor = pct >= 80 ? 'text-red-400' : pct >= 60 ? 'text-yellow-400' : 'text-green-400';
+  return h('div', { className: 'space-y-1' },
+    h('div', { className: 'flex justify-between items-center' },
+      h('span', { className: 'text-sm text-gray-400' }, label),
+      h('span', { className: `text-sm font-semibold ${textColor}` }, `${Math.round(pct)}%`)
+    ),
+    sub && h('div', { className: 'text-xs text-gray-500' }, sub),
+    h('div', { className: 'w-full bg-gray-800 rounded-full h-2' },
+      h('div', { className: `${color} h-2 rounded-full transition-all duration-500`, style: { width: `${Math.min(pct,100)}%` } })
+    )
+  );
+}
+
+// ─── Skeleton ────────────────────────────────────────────────────────────────
+function Skeleton({ rows = 5 }) {
+  return h('div', { className: 'space-y-3 p-4' },
+    ...Array.from({ length: rows }, (_, i) =>
+      h('div', { key: i, className: 'skeleton h-8 w-full' })
+    )
+  );
+}
+
+// ─── Error Box ───────────────────────────────────────────────────────────────
+function ErrorBox({ message, onRetry }) {
+  return h('div', { className: 'flex flex-col items-center gap-3 py-12 text-red-400' },
+    h('div', { className: 'text-lg' }, '⚠ Failed to load'),
+    h('div', { className: 'text-sm text-gray-500' }, message),
+    onRetry && h('button', {
+      onClick: onRetry,
+      className: 'mt-2 px-4 py-1.5 bg-accent hover:bg-purple-700 text-white text-sm rounded transition'
+    }, 'Retry')
+  );
+}
+
+// ─── Page Header ─────────────────────────────────────────────────────────────
+function PageHeader({ title, onRefresh, children }) {
+  return h('div', { className: 'flex items-center justify-between mb-6' },
+    h('h1', { className: 'text-2xl font-bold text-white' }, title),
+    h('div', { className: 'flex items-center gap-3' },
+      children,
+      h('button', {
+        onClick: onRefresh,
+        className: 'flex items-center gap-2 px-3 py-1.5 bg-[#1e1e2e] hover:bg-[#2a2a3e] border border-[#2a2a3e] text-gray-300 text-sm rounded-lg transition'
+      }, '↻ Refresh')
+    )
+  );
+}
+
+// ─── Stat Card ────────────────────────────────────────────────────────────────
+function StatCard({ label, value, sub }) {
+  return h('div', { className: 'card-bg rounded-xl p-5' },
+    h('div', { className: 'text-sm text-gray-500 mb-1' }, label),
+    h('div', { className: 'text-2xl font-bold text-white' }, value ?? '—'),
+    sub && h('div', { className: 'text-xs text-gray-500 mt-1' }, sub)
+  );
+}
+
+// ─── Table Shell ─────────────────────────────────────────────────────────────
+function Table({ headers, children, empty }) {
+  return h('div', { className: 'overflow-x-auto' },
+    h('table', { className: 'w-full text-sm' },
+      h('thead', null,
+        h('tr', { className: 'border-b border-[#1e1e2e]' },
+          ...headers.map(hd => h('th', { key: hd, className: 'text-left py-3 px-3 text-gray-500 font-medium text-xs uppercase tracking-wide whitespace-nowrap' }, hd))
+        )
+      ),
+      h('tbody', null, children || (empty && h('tr', null, h('td', { colSpan: headers.length, className: 'text-center py-10 text-gray-600' }, empty))))
+    )
+  );
+}
+
+function Tr({ children, className = '' }) {
+  return h('tr', { className: `border-b border-[#1e1e2e]/50 hover:bg-white/[0.02] transition ${className}` }, children);
+}
+
+function Td({ children, className = '' }) {
+  return h('td', { className: `py-3 px-3 ${className}` }, children);
+}
+
+// ─── Login Page ───────────────────────────────────────────────────────────────
+function LoginPage() {
+  const { login } = useAuth();
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+
+  const handleSubmit = async e => {
+    e.preventDefault();
+    setLoading(true);
+    setError('');
+    try { await login(email, password); }
+    catch (err) { setError(err.message); }
+    finally { setLoading(false); }
+  };
+
+  return h('div', { className: 'min-h-screen flex items-center justify-center px-4' },
+    h('div', { className: 'card-bg rounded-2xl p-8 w-full max-w-sm' },
+      h('div', { className: 'mb-8 text-center' },
+        h('div', { className: 'text-3xl font-black text-accent-light mb-1' }, '◈ ClawDrop'),
+        h('div', { className: 'text-gray-500 text-sm' }, 'Admin Control Panel')
+      ),
+      error && h('div', { className: 'mb-4 px-3 py-2.5 bg-red-900/30 border border-red-700/40 rounded-lg text-red-400 text-sm' }, error),
+      h('form', { onSubmit: handleSubmit, className: 'space-y-4' },
+        h('div', null,
+          h('label', { className: 'block text-xs text-gray-500 mb-1.5 uppercase tracking-wide' }, 'Email'),
+          h('input', {
+            type: 'email', value: email, onChange: e => setEmail(e.target.value), required: true,
+            className: 'w-full bg-[#0d0d14] border border-[#1e1e2e] rounded-lg px-3 py-2.5 text-white text-sm focus:outline-none focus:border-accent transition',
+            placeholder: 'admin@example.com'
+          })
+        ),
+        h('div', null,
+          h('label', { className: 'block text-xs text-gray-500 mb-1.5 uppercase tracking-wide' }, 'Password'),
+          h('input', {
+            type: 'password', value: password, onChange: e => setPassword(e.target.value), required: true,
+            className: 'w-full bg-[#0d0d14] border border-[#1e1e2e] rounded-lg px-3 py-2.5 text-white text-sm focus:outline-none focus:border-accent transition',
+            placeholder: '••••••••'
+          })
+        ),
+        h('button', {
+          type: 'submit', disabled: loading,
+          className: 'w-full bg-accent hover:bg-purple-700 disabled:opacity-60 text-white font-semibold py-2.5 rounded-lg transition mt-2'
+        }, loading ? 'Signing in…' : 'Sign In')
+      )
+    )
+  );
+}
+
+// ─── Sidebar ─────────────────────────────────────────────────────────────────
+const NAV = [
+  { hash: '#overview', label: 'Overview',  icon: '⬡' },
+  { hash: '#tenants',  label: 'Agents',    icon: '◈' },
+  { hash: '#users',    label: 'Users',     icon: '◎' },
+  { hash: '#billing',  label: 'Billing',   icon: '◇' },
+  { hash: '#audit',    label: 'Audit Log', icon: '◉' },
+  { hash: '#vps',      label: 'VPS Health',icon: '▣' },
+];
+
+function Sidebar({ hash }) {
+  const { user, logout } = useAuth();
+  return h('div', { className: 'sidebar-bg w-[220px] fixed top-0 left-0 h-screen flex flex-col z-20' },
+    h('div', { className: 'px-5 py-5 border-b border-[#1e1e2e]' },
+      h('div', { className: 'text-lg font-black text-accent-light' }, '◈ ClawDrop'),
+      h('div', { className: 'text-xs text-gray-600 mt-0.5' }, 'Admin Panel')
+    ),
+    h('nav', { className: 'flex-1 py-3 overflow-y-auto' },
+      ...NAV.map(item =>
+        h('a', {
+          key: item.hash,
+          href: item.hash,
+          className: `flex items-center gap-3 px-5 py-2.5 text-sm transition-all ${
+            hash === item.hash
+              ? 'bg-accent/20 text-accent-light border-r-2 border-accent'
+              : 'text-gray-400 hover:text-white hover:bg-white/5'
+          }`
+        },
+          h('span', { className: 'w-4 text-center text-base' }, item.icon),
+          item.label
+        )
+      )
+    ),
+    h('div', { className: 'px-5 py-4 border-t border-[#1e1e2e]' },
+      user && h('div', { className: 'text-xs text-gray-600 mb-3 truncate' }, user.email || user.name || 'Admin'),
+      h('button', {
+        onClick: logout,
+        className: 'w-full text-left flex items-center gap-3 text-sm text-gray-500 hover:text-red-400 transition py-1'
+      }, h('span', null, '↩'), 'Logout')
+    )
+  );
+}
+
+// ─── Overview Page ────────────────────────────────────────────────────────────
+function OverviewPage() {
+  const { data: ov, loading: lOv, error: eOv, refresh: rOv } = useApi('/admin/api/overview');
+  const { data: vps, loading: lVps, error: eVps, refresh: rVps } = useApi('/admin/api/vps');
+
+  const refresh = () => { rOv(); rVps(); };
+
+  useEffect(() => {
+    const t = setInterval(refresh, 30000);
+    return () => clearInterval(t);
+  }, []);
+
+  const agents = ov?.recent_agents || ov?.tenants?.slice(0,5) || [];
+
+  return h('div', null,
+    h(PageHeader, { title: 'Overview', onRefresh: refresh }),
+
+    // Stats
+    h('div', { className: 'grid grid-cols-2 lg:grid-cols-5 gap-4 mb-6' },
+      lOv
+        ? Array.from({length:5},(_,i)=>h('div',{key:i,className:'card-bg rounded-xl p-5'},h('div',{className:'skeleton h-8 w-3/4 mb-2'}),h('div',{className:'skeleton h-6 w-1/2'})))
+        : eOv
+          ? h('div',{className:'col-span-5'},h(ErrorBox,{message:eOv,onRetry:rOv}))
+          : [
+              h(StatCard,{key:'users',label:'Users',value:(ov?.user_count??ov?.users_count??'—').toLocaleString?.()??'—'}),
+              h(StatCard,{key:'agents',label:'Active Agents',value:(ov?.active_agents??ov?.active_tenants??'—').toLocaleString?.()??'—'}),
+              h(StatCard,{key:'mrr',label:'MRR',value:fmtMoney(ov?.mrr)}),
+              h(StatCard,{key:'arr',label:'ARR',value:fmtMoney(ov?.arr)}),
+              h(StatCard,{key:'subs',label:'Active Subs',value:(ov?.active_subscriptions??ov?.active_subs??'—').toLocaleString?.()??'—'}),
+            ]
+    ),
+
+    // VPS
+    h('div', { className: 'card-bg rounded-xl p-5 mb-6' },
+      h('div', { className: 'text-sm font-semibold text-gray-400 uppercase tracking-wide mb-4' }, 'VPS Resources'),
+      lVps
+        ? h('div',{className:'space-y-3'},Array.from({length:3},(_,i)=>h('div',{key:i,className:'skeleton h-6 w-full'})))
+        : eVps
+          ? h(ErrorBox,{message:eVps,onRetry:rVps})
+          : h('div', { className: 'grid grid-cols-1 md:grid-cols-3 gap-6' },
+              h(ProgressBar,{label:'Memory',pct:vps?.memory_pct??((vps?.memory_used_mb/vps?.memory_total_mb||0)*100),sub:`${vps?.memory_used_mb||0} / ${vps?.memory_total_mb||0} MB`}),
+              h(ProgressBar,{label:'Disk',pct:vps?.disk_pct??((vps?.disk_used_gb/vps?.disk_total_gb||0)*100),sub:`${vps?.disk_used_gb||0} / ${vps?.disk_total_gb||0} GB`}),
+              h(ProgressBar,{label:'Ports',pct:vps?.ports_pct??((vps?.ports_used/vps?.ports_total||0)*100),sub:`${vps?.ports_used||0} / ${vps?.ports_total||0} ports`})
+            )
+    ),
+
+    // Recent Agents
+    h('div', { className: 'card-bg rounded-xl p-5' },
+      h('div', { className: 'text-sm font-semibold text-gray-400 uppercase tracking-wide mb-4' }, 'Recent Agents'),
+      lOv
+        ? h(Skeleton,{rows:5})
+        : h(Table, { headers: ['Tenant ID','Agent Name','User ID','Status','Created'], empty: 'No recent agents' },
+            ...agents.map((a,i) =>
+              h(Tr, { key: a.tenant_id||i },
+                h(Td, null, h('code',{className:'text-xs text-purple-300'},truncateId(a.tenant_id))),
+                h(Td, null, h('span',{className:'text-gray-200'},a.agent_name||'—')),
+                h(Td, null, h('span',{className:'text-gray-400 text-xs'},a.telegram_user_id||a.user_id||'—')),
+                h(Td, null, h(StatusBadge,{status:a.status})),
+                h(Td, null, h('span',{className:'text-gray-500 text-xs'},fmtDate(a.created_at)))
+              )
+            )
+          )
+    )
+  );
+}
+
+// ─── Agents Page ──────────────────────────────────────────────────────────────
+function AgentsPage() {
+  const { data, loading, error, refresh } = useApi('/admin/api/tenants');
+  const { token } = useAuth();
+  const [search, setSearch] = useState('');
+  const [statusFilter, setStatusFilter] = useState('All');
+  const [confirmDelete, setConfirmDelete] = useState(null);
+  const [actionLoading, setActionLoading] = useState('');
+
+  const STATUS_TABS = ['All','Active','Provisioning','Stopped','Failed','Deleted'];
+
+  const filtered = (data?.tenants || data || []).filter(a => {
+    const q = search.toLowerCase();
+    const matchQ = !q || (a.tenant_id||'').toLowerCase().includes(q)
+      || (a.agent_name||'').toLowerCase().includes(q)
+      || String(a.telegram_user_id||a.user_id||'').includes(q);
+    const matchS = statusFilter === 'All' || a.status?.toLowerCase() === statusFilter.toLowerCase();
+    return matchQ && matchS;
+  });
+
+  const doAction = async (method, url, id) => {
+    setActionLoading(id);
+    try {
+      await fetch(url, { method, headers: { Authorization: 'Bearer ' + token } });
+      refresh();
+    } catch(e) { alert('Action failed: ' + e.message); }
+    finally { setActionLoading(''); }
+  };
+
+  return h('div', null,
+    h(PageHeader, { title: 'Agents', onRefresh: refresh },
+      h('input', {
+        type: 'text', value: search, onChange: e => setSearch(e.target.value),
+        placeholder: 'Search by name, ID, user…',
+        className: 'bg-[#1e1e2e] border border-[#2a2a3e] rounded-lg px-3 py-1.5 text-sm text-gray-300 placeholder-gray-600 focus:outline-none focus:border-accent w-56'
+      })
+    ),
+
+    // Status Tabs
+    h('div', { className: 'flex gap-1 mb-4 flex-wrap' },
+      ...STATUS_TABS.map(s =>
+        h('button', {
+          key: s,
+          onClick: () => setStatusFilter(s),
+          className: `px-3 py-1 rounded-lg text-sm transition ${statusFilter===s ? 'bg-accent text-white' : 'bg-[#1e1e2e] text-gray-400 hover:text-white'}`
+        }, s)
+      )
+    ),
+
+    h('div', { className: 'card-bg rounded-xl' },
+      loading ? h(Skeleton,{rows:8})
+      : error ? h(ErrorBox,{message:error,onRetry:refresh})
+      : h(Table, {
+          headers: ['Tenant ID','Agent Name','User ID','Status','Container','CPU%','Mem MB','Model','Created','Actions'],
+          empty: 'No agents found'
+        },
+        ...filtered.map(a =>
+          h(Tr, { key: a.tenant_id },
+            h(Td, null, h('code',{className:'text-xs text-purple-300 font-mono'},truncateId(a.tenant_id))),
+            h(Td, null, h('span',{className:'text-gray-200 text-sm'},a.agent_name||'—')),
+            h(Td, null, h('span',{className:'text-gray-400 text-xs'},a.telegram_user_id||a.user_id||'—')),
+            h(Td, null, h(StatusBadge,{status:a.status})),
+            h(Td, null, h(ContainerBadge,{running:a.container_running??a.running})),
+            h(Td, null, h('span',{className:'text-gray-400 text-xs'},a.cpu_pct!=null?a.cpu_pct+'%':'—')),
+            h(Td, null, h('span',{className:'text-gray-400 text-xs'},a.mem_mb!=null?a.mem_mb:'—')),
+            h(Td, null, h('span',{className:'text-gray-500 text-xs truncate max-w-[80px] block'},a.model||'—')),
+            h(Td, null, h('span',{className:'text-gray-500 text-xs'},fmtDate(a.created_at))),
+            h(Td, null,
+              h('div',{className:'flex gap-1'},
+                a.status==='stopped' && h('button',{
+                  onClick:()=>doAction('POST',`/admin/api/tenants/${a.tenant_id}/start`,a.tenant_id),
+                  disabled:actionLoading===a.tenant_id,
+                  className:'px-2 py-0.5 text-xs bg-green-900/40 hover:bg-green-800/60 text-green-300 rounded border border-green-700/30 transition disabled:opacity-50'
+                },'Start'),
+                (a.status==='active'||a.container_running) && h('button',{
+                  onClick:()=>doAction('POST',`/admin/api/tenants/${a.tenant_id}/stop`,a.tenant_id),
+                  disabled:actionLoading===a.tenant_id,
+                  className:'px-2 py-0.5 text-xs bg-yellow-900/40 hover:bg-yellow-800/60 text-yellow-300 rounded border border-yellow-700/30 transition disabled:opacity-50'
+                },'Stop'),
+                a.status!=='deleted' && h('button',{
+                  onClick:()=>setConfirmDelete(a),
+                  disabled:actionLoading===a.tenant_id,
+                  className:'px-2 py-0.5 text-xs bg-red-900/40 hover:bg-red-800/60 text-red-300 rounded border border-red-700/30 transition disabled:opacity-50'
+                },'Del')
+              )
+            )
+          )
+        )
+      )
+    ),
+
+    // Delete confirm modal
+    confirmDelete && h('div', {
+      className: 'fixed inset-0 bg-black/70 flex items-center justify-center z-50',
+      onClick: () => setConfirmDelete(null)
+    },
+      h('div', {
+        className: 'card-bg rounded-2xl p-6 w-full max-w-sm mx-4',
+        onClick: e => e.stopPropagation()
+      },
+        h('h2',{className:'text-lg font-bold text-white mb-2'},'Delete Agent'),
+        h('p',{className:'text-gray-400 text-sm mb-1'},'Are you sure you want to delete:'),
+        h('p',{className:'text-accent-light font-mono text-sm mb-4'},confirmDelete.agent_name||confirmDelete.tenant_id),
+        h('div',{className:'flex gap-3'},
+          h('button',{
+            onClick:()=>{
+              doAction('DELETE',`/admin/api/tenants/${confirmDelete.tenant_id}`,confirmDelete.tenant_id);
+              setConfirmDelete(null);
+            },
+            className:'flex-1 bg-red-700 hover:bg-red-600 text-white py-2 rounded-lg text-sm transition'
+          },'Delete'),
+          h('button',{
+            onClick:()=>setConfirmDelete(null),
+            className:'flex-1 bg-[#1e1e2e] hover:bg-[#2a2a3e] text-gray-300 py-2 rounded-lg text-sm transition'
+          },'Cancel')
+        )
+      )
+    )
+  );
+}
+
+// ─── Users Page ───────────────────────────────────────────────────────────────
+function UsersPage() {
+  const { data, loading, error, refresh } = useApi('/admin/api/users');
+  const [search, setSearch] = useState('');
+
+  const users = data?.users || data || [];
+  const filtered = users.filter(u =>
+    !search || String(u.user_id||u.telegram_user_id||u.id||'').includes(search) ||
+    (u.email||'').toLowerCase().includes(search.toLowerCase())
+  );
+
+  return h('div', null,
+    h(PageHeader, { title: 'Users', onRefresh: refresh },
+      h('input', {
+        type: 'text', value: search, onChange: e => setSearch(e.target.value),
+        placeholder: 'Search by user ID or email…',
+        className: 'bg-[#1e1e2e] border border-[#2a2a3e] rounded-lg px-3 py-1.5 text-sm text-gray-300 placeholder-gray-600 focus:outline-none focus:border-accent w-56'
+      })
+    ),
+    h('div', { className: 'card-bg rounded-xl' },
+      loading ? h(Skeleton,{rows:8})
+      : error ? h(ErrorBox,{message:error,onRetry:refresh})
+      : h(Table, {
+          headers: ['User ID','Email','Total Agents','Active Agents','Joined'],
+          empty: 'No users found'
+        },
+        ...filtered.map((u,i) =>
+          h(Tr, { key: u.user_id||u.telegram_user_id||u.id||i },
+            h(Td, null, h('code',{className:'text-xs text-purple-300 font-mono'},u.user_id||u.telegram_user_id||u.id||'—')),
+            h(Td, null, h('span',{className:'text-gray-300 text-sm'},u.email||'—')),
+            h(Td, null, h('span',{className:'text-gray-300'},(u.total_agents??u.agent_count??'—').toString())),
+            h(Td, null, h('span',{className:'text-green-400'},(u.active_agents??'—').toString())),
+            h(Td, null, h('span',{className:'text-gray-500 text-xs'},fmtDate(u.created_at||u.joined_at)))
+          )
+        )
+      )
+    )
+  );
+}
+
+// ─── Billing Page ─────────────────────────────────────────────────────────────
+function BillingPage() {
+  const { data, loading, error, refresh } = useApi('/admin/api/billing');
+
+  const subs = data?.subscriptions || [];
+  const invoices = data?.invoices || [];
+  const mrr = data?.mrr || 0;
+  const arr = data?.arr || 0;
+  const activeSubs = data?.active_subscriptions ?? subs.filter(s=>s.status==='active').length;
+
+  return h('div', null,
+    h(PageHeader, { title: 'Billing', onRefresh: refresh }),
+
+    // Stats
+    h('div', { className: 'grid grid-cols-3 gap-4 mb-6' },
+      loading
+        ? Array.from({length:3},(_,i)=>h('div',{key:i,className:'card-bg rounded-xl p-5'},h('div',{className:'skeleton h-8 w-3/4'})))
+        : [
+            h(StatCard,{key:'mrr',label:'MRR',value:fmtMoney(mrr)}),
+            h(StatCard,{key:'arr',label:'ARR',value:fmtMoney(arr)}),
+            h(StatCard,{key:'subs',label:'Active Subscriptions',value:activeSubs.toLocaleString?.()??activeSubs}),
+          ]
+    ),
+
+    error && h(ErrorBox,{message:error,onRetry:refresh}),
+
+    // Subscriptions
+    !error && h('div', { className: 'card-bg rounded-xl mb-6' },
+      h('div',{className:'px-5 py-4 border-b border-[#1e1e2e] text-sm font-semibold text-gray-400 uppercase tracking-wide'},'Subscriptions'),
+      loading ? h(Skeleton,{rows:5})
+      : h(Table, { headers: ['User ID','Plan','Billing','Status','Period End','Created'], empty: 'No subscriptions' },
+          ...subs.map((s,i) =>
+            h(Tr, { key: s.id||s.subscription_id||i },
+              h(Td, null, h('code',{className:'text-xs text-purple-300'},s.user_id||s.telegram_user_id||'—')),
+              h(Td, null, h('span',{className:'text-gray-200 text-sm'},s.plan||s.plan_name||'—')),
+              h(Td, null, h('span',{className:'text-gray-400 text-xs capitalize'},s.billing_interval||s.interval||'—')),
+              h(Td, null, h(StatusBadge,{status:s.status})),
+              h(Td, null, h('span',{className:'text-gray-500 text-xs'},fmtDate(s.current_period_end||s.period_end))),
+              h(Td, null, h('span',{className:'text-gray-500 text-xs'},fmtDate(s.created_at)))
+            )
+          )
+        )
+    ),
+
+    // Invoices
+    !error && h('div', { className: 'card-bg rounded-xl' },
+      h('div',{className:'px-5 py-4 border-b border-[#1e1e2e] text-sm font-semibold text-gray-400 uppercase tracking-wide'},'Invoices'),
+      loading ? h(Skeleton,{rows:5})
+      : h(Table, { headers: ['Invoice ID','User','Amount (USD)','Currency','Status','NP Payment ID','Created'], empty: 'No invoices' },
+          ...invoices.map((inv,i) =>
+            h(Tr, { key: inv.id||inv.invoice_id||i },
+              h(Td, null, h('code',{className:'text-xs text-gray-400 font-mono'},truncateId(inv.id||inv.invoice_id||'—'))),
+              h(Td, null, h('span',{className:'text-gray-400 text-xs'},inv.user_id||inv.telegram_user_id||'—')),
+              h(Td, null, h('span',{className:'text-gray-200 font-medium'},fmtMoney(inv.amount_usd??inv.amount))),
+              h(Td, null, h('span',{className:'text-gray-500 text-xs uppercase'},inv.currency||'USD')),
+              h(Td, null, h(StatusBadge,{status:inv.status})),
+              h(Td, null, h('code',{className:'text-xs text-gray-500'},inv.np_payment_id||inv.payment_id||'—')),
+              h(Td, null, h('span',{className:'text-gray-500 text-xs'},fmtDate(inv.created_at)))
+            )
+          )
+        )
+    )
+  );
+}
+
+// ─── Audit Log Page ───────────────────────────────────────────────────────────
+function AuditPage() {
+  const [search, setSearch] = useState('');
+  const [offset, setOffset] = useState(0);
+  const LIMIT = 50;
+
+  const url = `/admin/api/audit-logs?limit=${LIMIT}&offset=${offset}&search=${encodeURIComponent(search)}`;
+  const { data, loading, error, refresh } = useApi(url, [offset, search]);
+
+  const logs = data?.logs || data?.audit_logs || data || [];
+  const total = data?.total || logs.length;
+
+  const handleSearch = e => { setSearch(e.target.value); setOffset(0); };
+
+  return h('div', null,
+    h(PageHeader, { title: 'Audit Log', onRefresh: refresh },
+      h('input', {
+        type: 'text', value: search, onChange: handleSearch,
+        placeholder: 'Search action, actor…',
+        className: 'bg-[#1e1e2e] border border-[#2a2a3e] rounded-lg px-3 py-1.5 text-sm text-gray-300 placeholder-gray-600 focus:outline-none focus:border-accent w-56'
+      })
+    ),
+    h('div', { className: 'card-bg rounded-xl' },
+      loading ? h(Skeleton,{rows:10})
+      : error ? h(ErrorBox,{message:error,onRetry:refresh})
+      : h('div', null,
+          h(Table, { headers: ['Timestamp','Actor','Action','Target Type','Target ID','IP'], empty: 'No audit log entries' },
+            ...logs.map((l,i) =>
+              h(Tr, { key: l.id||i },
+                h(Td, null, h('span',{className:'text-gray-500 text-xs whitespace-nowrap'},fmtDate(l.created_at||l.timestamp))),
+                h(Td, null, h('span',{className:'text-gray-300 text-xs'},l.actor_email||l.actor||'—')),
+                h(Td, null, h('code',{className:'text-xs bg-[#1e1e2e] px-1.5 py-0.5 rounded text-purple-300'},l.action||'—')),
+                h(Td, null, h('span',{className:'text-gray-400 text-xs'},l.target_type||'—')),
+                h(Td, null, h('code',{className:'text-xs text-gray-500'},truncateId(l.target_id))),
+                h(Td, null, h('span',{className:'text-gray-600 text-xs font-mono'},l.ip||l.ip_address||'—'))
+              )
+            )
+          ),
+          h('div', { className: 'flex items-center justify-between px-5 py-3 border-t border-[#1e1e2e]' },
+            h('span', { className: 'text-xs text-gray-600' }, `Showing ${offset+1}–${Math.min(offset+LIMIT, total)} of ${total}`),
+            h('div', { className: 'flex gap-2' },
+              h('button', {
+                onClick: () => setOffset(Math.max(0, offset-LIMIT)),
+                disabled: offset === 0,
+                className: 'px-3 py-1 text-xs bg-[#1e1e2e] hover:bg-[#2a2a3e] text-gray-400 rounded disabled:opacity-40 transition'
+              }, '← Prev'),
+              h('button', {
+                onClick: () => setOffset(offset+LIMIT),
+                disabled: offset+LIMIT >= total,
+                className: 'px-3 py-1 text-xs bg-[#1e1e2e] hover:bg-[#2a2a3e] text-gray-400 rounded disabled:opacity-40 transition'
+              }, 'Next →')
+            )
+          )
+        )
+    )
+  );
+}
+
+// ─── VPS Health Page ──────────────────────────────────────────────────────────
+function VpsPage() {
+  const { data, loading, error, refresh } = useApi('/admin/api/vps');
+
+  useEffect(() => {
+    const t = setInterval(refresh, 30000);
+    return () => clearInterval(t);
+  }, []);
+
+  const containers = data?.containers || [];
+  const memPct = data?.memory_pct ?? ((data?.memory_used_mb/data?.memory_total_mb||0)*100);
+  const diskPct = data?.disk_pct ?? ((data?.disk_used_gb/data?.disk_total_gb||0)*100);
+  const portsPct = data?.ports_pct ?? ((data?.ports_used/data?.ports_total||0)*100);
+
+  const metricBarColor = pct => pct >= 80 ? 'bg-red-500' : pct >= 60 ? 'bg-yellow-500' : 'bg-green-500';
+  const metricTextColor = pct => pct >= 80 ? 'text-red-400' : pct >= 60 ? 'text-yellow-400' : 'text-green-400';
+
+  function BigMetricCard({ label, pct, detail, icon }) {
+    return h('div', { className: 'card-bg rounded-xl p-6' },
+      h('div', { className: 'flex items-center justify-between mb-4' },
+        h('div', { className: 'text-gray-400 text-sm font-semibold uppercase tracking-wide' }, `${icon} ${label}`),
+        h('div', { className: `text-3xl font-black ${metricTextColor(pct)}` }, `${Math.round(pct)}%`)
+      ),
+      h('div', { className: 'text-xs text-gray-500 mb-3' }, detail),
+      h('div', { className: 'w-full bg-gray-800 rounded-full h-3' },
+        h('div', { className: `${metricBarColor(pct)} h-3 rounded-full transition-all duration-500`, style: { width: `${Math.min(pct||0,100)}%` } })
+      )
+    );
+  }
+
+  return h('div', null,
+    h(PageHeader, { title: 'VPS Health', onRefresh: refresh }),
+
+    loading ? h('div',{className:'grid grid-cols-1 md:grid-cols-3 gap-4 mb-6'},Array.from({length:3},(_,i)=>h('div',{key:i,className:'card-bg rounded-xl p-6'},h('div',{className:'skeleton h-16 w-full'}))))
+    : error ? h(ErrorBox,{message:error,onRetry:refresh})
+    : h('div', null,
+
+      // Hostname
+      data?.hostname && h('div',{className:'card-bg rounded-xl p-4 mb-4 flex items-center gap-3'},
+        h('span',{className:'text-gray-500 text-sm'},'Hostname:'),
+        h('span',{className:'text-accent-light font-mono text-sm'},data.hostname)
+      ),
+
+      // Big metric cards
+      h('div', { className: 'grid grid-cols-1 md:grid-cols-3 gap-4 mb-6' },
+        h(BigMetricCard,{label:'Memory',pct:memPct,detail:`${data?.memory_used_mb||0} / ${data?.memory_total_mb||0} MB used`,icon:'◈'}),
+        h(BigMetricCard,{label:'Disk',pct:diskPct,detail:`${data?.disk_used_gb||0} / ${data?.disk_total_gb||0} GB used`,icon:'▣'}),
+        h(BigMetricCard,{label:'Ports',pct:portsPct,detail:`${data?.ports_used||0} / ${data?.ports_total||0} ports used`,icon:'◎'})
+      ),
+
+      // Docker containers
+      h('div', { className: 'card-bg rounded-xl' },
+        h('div',{className:'px-5 py-4 border-b border-[#1e1e2e] text-sm font-semibold text-gray-400 uppercase tracking-wide'},'Docker Containers'),
+        h(Table, { headers: ['Name','CPU%','Mem MB','Status'], empty: 'No containers' },
+          ...containers.map((c,i) =>
+            h(Tr, { key: c.name||c.id||i },
+              h(Td, null, h('code',{className:'text-sm text-gray-200 font-mono'},c.name||c.id||'—')),
+              h(Td, null,
+                h('span',{className:`text-sm ${(c.cpu_pct||0)>=80?'text-red-400':(c.cpu_pct||0)>=60?'text-yellow-400':'text-green-400'}`},
+                  c.cpu_pct!=null?c.cpu_pct+'%':'—')
+              ),
+              h(Td, null, h('span',{className:'text-gray-300 text-sm'},c.mem_mb!=null?c.mem_mb:'—')),
+              h(Td, null, h(ContainerBadge,{running:c.running??c.status==='running'}))
+            )
+          )
+        )
+      )
+    )
+  );
+}
+
+// ─── Layout ───────────────────────────────────────────────────────────────────
+function Layout() {
+  const hash = useHash();
+
+  const PAGE = {
+    '#overview': h(OverviewPage),
+    '#tenants':  h(AgentsPage),
+    '#users':    h(UsersPage),
+    '#billing':  h(BillingPage),
+    '#audit':    h(AuditPage),
+    '#vps':      h(VpsPage),
+  };
+
+  const page = PAGE[hash] || PAGE['#overview'];
+
+  return h('div', { className: 'flex' },
+    h(Sidebar, { hash }),
+    h('main', { className: 'ml-[220px] flex-1 min-h-screen p-6 overflow-x-hidden' },
+      h('div', { className: 'max-w-7xl mx-auto' }, page)
+    )
+  );
+}
+
+// ─── App Root ─────────────────────────────────────────────────────────────────
+function App() {
+  const { token, checking } = useAuth();
+
+  if (checking) {
+    return h('div', { className: 'min-h-screen flex items-center justify-center' },
+      h('div', { className: 'text-accent-light text-lg animate-pulse' }, 'Loading…')
+    );
+  }
+
+  return token ? h(Layout) : h(LoginPage);
+}
+
+function Root() {
+  return h(AuthProvider, null, h(App));
+}
+
+// ─── Mount ────────────────────────────────────────────────────────────────────
+const root = createRoot(document.getElementById('root'));
+root.render(h(Root));
+</script>
+<div id="root"></div>
+</body>
+</html>

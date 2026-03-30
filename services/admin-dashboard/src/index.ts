@@ -1,387 +1,675 @@
-/**
- * HFSP Admin Dashboard
- * Internal service — port 3002, protected by ADMIN_TOKEN header or query param.
- * Provides read + control API over tenants, users, and VPS capacity.
- */
-import express from 'express';
-import Database from 'better-sqlite3';
-import { execSync, execFile } from 'child_process';
-import { readFileSync, existsSync } from 'fs';
-import path from 'path';
+import express = require('express');
+import type { Request, Response, NextFunction } from 'express';
+import Database = require('better-sqlite3');
+import bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken') as typeof import('jsonwebtoken');
+const { rateLimit } = require('express-rate-limit') as typeof import('express-rate-limit');
+import { execSync } from 'child_process';
+import * as fs from 'fs';
+import * as path from 'path';
+import * as os from 'os';
+import * as crypto from 'crypto';
 
-const PORT = parseInt(process.env.ADMIN_PORT ?? '3002', 10);
-const ADMIN_TOKEN = process.env.ADMIN_TOKEN ?? (() => {
-  const f = path.join(process.env.HOME ?? '/home/hfsp', '.openclaw/secrets/admin.token');
-  return existsSync(f) ? readFileSync(f, 'utf8').trim() : 'changeme';
-})();
-const DB_PATH = path.resolve(__dirname, '../../../data/storefront.sqlite');
-const PORT_REGISTRY_PATH = path.join(process.env.HOME ?? '/home/hfsp', '.openclaw/port-registry.json');
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
 
-const db = new Database(DB_PATH, { readonly: false });
+interface AdminUser {
+  id: string;
+  email: string;
+  password_h: string;
+  role: string;
+  created_at: string;
+}
+
+interface JWTPayload {
+  id: string;
+  email: string;
+  role: string;
+}
+
+interface AuthenticatedRequest extends Request {
+  user?: JWTPayload;
+}
+
+interface CapacityInfo {
+  memTotalMb: number;
+  memAvailMb: number;
+  memUsedPct: number;
+  diskTotalGb: number;
+  diskUsedGb: number;
+  diskAvailGb: number;
+  diskUsedPct: number;
+  portRegistry: Record<string, unknown>;
+}
+
+interface DockerStatLine {
+  containerId: string;
+  name: string;
+  cpuPct: string;
+  memUsage: string;
+  memPct: string;
+  netIO: string;
+  blockIO: string;
+  pids: string;
+}
+
+// ---------------------------------------------------------------------------
+// JWT Secret — persisted to ~/.openclaw/secrets/admin_jwt.secret
+// ---------------------------------------------------------------------------
+
+function loadOrCreateJwtSecret(): string {
+  const secretDir = path.join(os.homedir(), '.openclaw', 'secrets');
+  const secretFile = path.join(secretDir, 'admin_jwt.secret');
+
+  if (fs.existsSync(secretFile)) {
+    return fs.readFileSync(secretFile, 'utf8').trim();
+  }
+
+  fs.mkdirSync(secretDir, { recursive: true });
+  const secret = crypto.randomBytes(64).toString('hex');
+  fs.writeFileSync(secretFile, secret, { mode: 0o600 });
+  return secret;
+}
+
+const JWT_SECRET = loadOrCreateJwtSecret();
+const JWT_EXPIRY = '24h';
+
+// ---------------------------------------------------------------------------
+// Database setup
+// ---------------------------------------------------------------------------
+
+const DB_PATH = process.env.DB_PATH
+  ? process.env.DB_PATH
+  : path.resolve(__dirname, '../../../data/storefront.sqlite');
+
+const db = new Database(DB_PATH);
 db.pragma('journal_mode = WAL');
+db.pragma('foreign_keys = ON');
 
-const app = express();
-app.use(express.json());
+// Create admin_users table
+db.exec(`
+  CREATE TABLE IF NOT EXISTS admin_users (
+    id         TEXT PRIMARY KEY,
+    email      TEXT UNIQUE NOT NULL,
+    password_h TEXT NOT NULL,
+    role       TEXT NOT NULL DEFAULT 'admin',
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+`);
 
-// ── Auth middleware ────────────────────────────────────────────────────────
-app.use((req, res, next) => {
-  const token = req.headers['x-admin-token'] ?? req.query.token;
-  if (token !== ADMIN_TOKEN) {
-    res.status(401).json({ error: 'Unauthorized' });
+// Create audit_logs table
+db.exec(`
+  CREATE TABLE IF NOT EXISTS audit_logs (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    actor_id     TEXT,
+    actor_email  TEXT,
+    action       TEXT NOT NULL,
+    target_type  TEXT,
+    target_id    TEXT,
+    metadata     TEXT,
+    ip           TEXT,
+    created_at   TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+`);
+
+// ---------------------------------------------------------------------------
+// First-run: auto-create default admin if no users exist
+// ---------------------------------------------------------------------------
+
+function bootstrapDefaultAdmin(): void {
+  const count = (db.prepare('SELECT COUNT(*) as cnt FROM admin_users').get() as { cnt: number }).cnt;
+  if (count > 0) return;
+
+  const password = crypto.randomBytes(8).toString('hex'); // 16 hex chars
+  const hash = bcrypt.hashSync(password, 12);
+  const id = crypto.randomUUID();
+
+  db.prepare(
+    'INSERT INTO admin_users (id, email, password_h, role) VALUES (?, ?, ?, ?)'
+  ).run(id, 'admin@hfsp.cloud', hash, 'owner');
+
+  const border = '═'.repeat(52);
+  console.log(`
+╔${border}╗
+║          HFSP Admin — First-Run Credentials          ║
+╠${border}╣
+║  Email   : admin@hfsp.cloud                          ║
+║  Password: ${password}                         ║
+║  Role    : owner                                     ║
+╠${border}╣
+║  SAVE THESE CREDENTIALS — they won't be shown again  ║
+╚${border}╝
+`);
+}
+
+bootstrapDefaultAdmin();
+
+// ---------------------------------------------------------------------------
+// Helpers: getCapacity, getDockerStats
+// ---------------------------------------------------------------------------
+
+function getCapacity(): CapacityInfo {
+  // Memory from /proc/meminfo
+  let memTotalMb = 0;
+  let memAvailMb = 0;
+  try {
+    const meminfo = fs.readFileSync('/proc/meminfo', 'utf8');
+    const totalMatch = meminfo.match(/MemTotal:\s+(\d+)\s+kB/);
+    const availMatch = meminfo.match(/MemAvailable:\s+(\d+)\s+kB/);
+    if (totalMatch) memTotalMb = Math.round(parseInt(totalMatch[1], 10) / 1024);
+    if (availMatch) memAvailMb = Math.round(parseInt(availMatch[1], 10) / 1024);
+  } catch {
+    // Not Linux — skip
+  }
+  const memUsedPct = memTotalMb > 0
+    ? Math.round(((memTotalMb - memAvailMb) / memTotalMb) * 100)
+    : 0;
+
+  // Disk from df
+  let diskTotalGb = 0;
+  let diskUsedGb = 0;
+  let diskAvailGb = 0;
+  let diskUsedPct = 0;
+  try {
+    const dfOut = execSync("df -BG / | tail -1", { encoding: 'utf8' });
+    const parts = dfOut.trim().split(/\s+/);
+    diskTotalGb = parseInt(parts[1], 10);
+    diskUsedGb  = parseInt(parts[2], 10);
+    diskAvailGb = parseInt(parts[3], 10);
+    diskUsedPct = parseInt(parts[4], 10);
+  } catch {
+    // ignore
+  }
+
+  // Port registry
+  let portRegistry: Record<string, unknown> = {};
+  const registryPath = path.resolve(__dirname, '../../../data/port-registry.json');
+  try {
+    portRegistry = JSON.parse(fs.readFileSync(registryPath, 'utf8'));
+  } catch {
+    // ignore if missing
+  }
+
+  return { memTotalMb, memAvailMb, memUsedPct, diskTotalGb, diskUsedGb, diskAvailGb, diskUsedPct, portRegistry };
+}
+
+function getDockerStats(): DockerStatLine[] {
+  try {
+    const raw = execSync(
+      "docker stats --no-stream --format '{{.ID}}|{{.Name}}|{{.CPUPerc}}|{{.MemUsage}}|{{.MemPerc}}|{{.NetIO}}|{{.BlockIO}}|{{.PIDs}}'",
+      { encoding: 'utf8', timeout: 15000 }
+    );
+    return raw
+      .trim()
+      .split('\n')
+      .filter(Boolean)
+      .map((line) => {
+        const [containerId, name, cpuPct, memUsage, memPct, netIO, blockIO, pids] = line.split('|');
+        return { containerId, name, cpuPct, memUsage, memPct, netIO, blockIO, pids };
+      });
+  } catch {
+    return [];
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Audit helper
+// ---------------------------------------------------------------------------
+
+function audit(
+  req: AuthenticatedRequest,
+  action: string,
+  targetType?: string,
+  targetId?: string,
+  metadata?: Record<string, unknown>
+): void {
+  try {
+    db.prepare(`
+      INSERT INTO audit_logs (actor_id, actor_email, action, target_type, target_id, metadata, ip)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      req.user?.id ?? null,
+      req.user?.email ?? null,
+      action,
+      targetType ?? null,
+      targetId ?? null,
+      metadata ? JSON.stringify(metadata) : null,
+      req.ip ?? null
+    );
+  } catch (err) {
+    console.error('[audit] failed to write log:', err);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// MRR / ARR calculation
+// ---------------------------------------------------------------------------
+
+function calcMrrArr(): { mrr: number; arr: number } {
+  try {
+    const monthly = db.prepare(`
+      SELECT COALESCE(SUM(p.price_usd), 0) as total
+      FROM subscriptions s
+      JOIN plans p ON p.id = s.plan_id
+      WHERE s.status = 'active' AND p.billing = 'monthly'
+    `).get() as { total: number };
+
+    const yearly = db.prepare(`
+      SELECT COALESCE(SUM(p.price_usd), 0) as total
+      FROM subscriptions s
+      JOIN plans p ON p.id = s.plan_id
+      WHERE s.status = 'active' AND p.billing = 'yearly'
+    `).get() as { total: number };
+
+    const mrr = monthly.total + yearly.total / 12;
+    const arr = mrr * 12;
+    return { mrr: Math.round(mrr * 100) / 100, arr: Math.round(arr * 100) / 100 };
+  } catch {
+    return { mrr: 0, arr: 0 };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Auth middleware
+// ---------------------------------------------------------------------------
+
+function requireAuth(req: AuthenticatedRequest, res: Response, next: NextFunction): void {
+  const header = req.headers.authorization;
+  if (!header || !header.startsWith('Bearer ')) {
+    res.status(401).json({ ok: false, error: 'Missing or invalid Authorization header' });
     return;
   }
-  next();
-});
 
-// ── Helpers ───────────────────────────────────────────────────────────────
-function getCapacity() {
-  const memKb = parseInt(
-    execSync("awk '/MemAvailable/ {print $2}' /proc/meminfo").toString().trim(), 10
-  );
-  const memTotalKb = parseInt(
-    execSync("awk '/MemTotal/ {print $2}' /proc/meminfo").toString().trim(), 10
-  );
-  const diskKb = parseInt(
-    execSync("df --output=avail / | tail -1").toString().trim(), 10
-  );
-  const diskTotalKb = parseInt(
-    execSync("df --output=size / | tail -1").toString().trim(), 10
-  );
-
-  let portUsed = 0;
-  if (existsSync(PORT_REGISTRY_PATH)) {
-    portUsed = Object.keys(JSON.parse(readFileSync(PORT_REGISTRY_PATH, 'utf8'))).length;
+  const token = header.slice(7);
+  try {
+    const payload = jwt.verify(token, JWT_SECRET) as JWTPayload;
+    req.user = { id: payload.id, email: payload.email, role: payload.role };
+    next();
+  } catch {
+    res.status(401).json({ ok: false, error: 'Invalid or expired token' });
   }
-  const PORT_MAX = 1000;
+}
 
-  return {
-    memory: {
-      availMb: Math.round(memKb / 1024),
-      totalMb: Math.round(memTotalKb / 1024),
-      usedPct: Math.round(((memTotalKb - memKb) / memTotalKb) * 100),
-    },
-    disk: {
-      availGb: Math.round(diskKb / 1024 / 1024 * 10) / 10,
-      totalGb: Math.round(diskTotalKb / 1024 / 1024 * 10) / 10,
-      usedPct: Math.round(((diskTotalKb - diskKb) / diskTotalKb) * 100),
-    },
-    ports: {
-      used: portUsed,
-      total: PORT_MAX,
-      usedPct: Math.round((portUsed / PORT_MAX) * 100),
-    },
+// ---------------------------------------------------------------------------
+// RBAC middleware factory
+// ---------------------------------------------------------------------------
+
+const ROLE_RANK: Record<string, number> = { viewer: 1, admin: 2, owner: 3 };
+
+function requireRole(...roles: string[]) {
+  return (req: AuthenticatedRequest, res: Response, next: NextFunction): void => {
+    if (!req.user) {
+      res.status(401).json({ ok: false, error: 'Not authenticated' });
+      return;
+    }
+    const userRank = ROLE_RANK[req.user.role] ?? 0;
+    const allowed = roles.some((r) => {
+      const requiredRank = ROLE_RANK[r] ?? 999;
+      return userRank >= requiredRank;
+    });
+    if (!allowed) {
+      res.status(403).json({ ok: false, error: `Requires one of roles: ${roles.join(', ')}` });
+      return;
+    }
+    next();
   };
 }
 
-function getDockerStats(): Record<string, { running: boolean; cpuPct?: number; memMb?: number }> {
+// ---------------------------------------------------------------------------
+// Express app
+// ---------------------------------------------------------------------------
+
+const app = express();
+app.set('trust proxy', 1);
+app.use(express.json());
+
+// Static files for the React SPA
+app.use('/admin', express.static(path.join(__dirname, '../public')));
+
+// ---------------------------------------------------------------------------
+// Rate limiter for login
+// ---------------------------------------------------------------------------
+
+const loginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { ok: false, error: 'Too many login attempts. Please try again later.' },
+});
+
+// ---------------------------------------------------------------------------
+// Routes
+// ---------------------------------------------------------------------------
+
+// GET /admin/health
+app.get('/admin/health', (_req: Request, res: Response) => {
+  res.json({ ok: true });
+});
+
+// POST /admin/auth/login
+app.post('/admin/auth/login', loginLimiter, async (req: Request, res: Response): Promise<void> => {
+  const { email, password } = req.body as { email?: string; password?: string };
+
+  if (!email || !password) {
+    res.status(400).json({ ok: false, error: 'email and password are required' });
+    return;
+  }
+
+  const user = db.prepare('SELECT * FROM admin_users WHERE email = ?').get(email) as AdminUser | undefined;
+  if (!user) {
+    res.status(401).json({ ok: false, error: 'Invalid credentials' });
+    return;
+  }
+
+  const valid = await bcrypt.compare(password, user.password_h);
+  if (!valid) {
+    res.status(401).json({ ok: false, error: 'Invalid credentials' });
+    return;
+  }
+
+  const token = jwt.sign(
+    { id: user.id, email: user.email, role: user.role },
+    JWT_SECRET,
+    { expiresIn: JWT_EXPIRY }
+  );
+
+  res.json({ ok: true, token, user: { id: user.id, email: user.email, role: user.role } });
+});
+
+// POST /admin/auth/logout
+app.post('/admin/auth/logout', requireAuth, (req: AuthenticatedRequest, res: Response) => {
+  audit(req, 'auth.logout');
+  res.json({ ok: true });
+});
+
+// GET /admin/auth/me
+app.get('/admin/auth/me', requireAuth, (req: AuthenticatedRequest, res: Response) => {
+  res.json({ ok: true, user: req.user });
+});
+
+// GET /admin/api/overview
+app.get('/admin/api/overview', requireAuth, (_req: AuthenticatedRequest, res: Response) => {
   try {
-    const raw = execSync(
-      `docker stats --no-stream --format '{{.Name}}|{{.CPUPerc}}|{{.MemUsage}}' 2>/dev/null || true`
-    ).toString().trim();
-    const result: Record<string, any> = {};
-    for (const line of raw.split('\n').filter(Boolean)) {
-      const [name, cpu, mem] = line.split('|');
-      const memMb = mem ? parseFloat(mem.split('/')[0].replace(/[^0-9.]/g, '')) : undefined;
-      result[name.trim()] = {
-        running: true,
-        cpuPct: parseFloat(cpu?.replace('%', '') ?? '0'),
-        memMb: memMb,
-      };
+    const users = (db.prepare('SELECT COUNT(*) as cnt FROM users').get() as { cnt: number }).cnt;
+    const tenants = (db.prepare('SELECT COUNT(*) as cnt FROM tenants').get() as { cnt: number }).cnt;
+    const activeSubs = (
+      db.prepare("SELECT COUNT(*) as cnt FROM subscriptions WHERE status = 'active'").get() as { cnt: number }
+    ).cnt;
+
+    // activeAgents = tenants with active status in DB
+    let activeAgents = 0;
+    try {
+      const dockerOut = execSync("docker ps --format '{{.Names}}' 2>/dev/null || true", {
+        encoding: 'utf8',
+        timeout: 10000,
+      });
+      activeAgents = dockerOut.trim().split('\n').filter(Boolean).length;
+    } catch {
+      // ignore
     }
-    return result;
-  } catch {
-    return {};
+
+    const { mrr, arr } = calcMrrArr();
+    const vps = getCapacity();
+
+    res.json({ ok: true, data: { users, tenants, activeAgents, mrrUsd: mrr, arrUsd: arr, activeSubs, vps } });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: String(err) });
   }
-}
+});
 
-// ── Routes ─────────────────────────────────────────────────────────────────
-
-// GET /health — unauthenticated
-app.get('/health', (_req, res) => res.json({ ok: true }));
-
-// GET /api/vps — VPS capacity snapshot
-app.get('/api/vps', (_req, res) => {
+// GET /admin/api/vps
+app.get('/admin/api/vps', requireAuth, (_req: AuthenticatedRequest, res: Response) => {
   try {
-    res.json({ ok: true, vps: { hostname: execSync('hostname').toString().trim(), ...getCapacity() } });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: String(e) });
+    const capacity = getCapacity();
+    const dockerStats = getDockerStats();
+
+    let hostname = '';
+    try {
+      hostname = execSync('hostname', { encoding: 'utf8' }).trim();
+    } catch {
+      // ignore
+    }
+
+    res.json({ ok: true, data: { hostname, capacity, dockerStats } });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: String(err) });
   }
 });
 
-// GET /api/users — all users + tenant counts
-app.get('/api/users', (_req, res) => {
-  const rows = db.prepare(`
-    SELECT u.telegram_user_id,
-           u.created_at,
-           COUNT(t.tenant_id) as tenant_count,
-           SUM(CASE WHEN t.status IN ('active','provisioning') AND t.deleted_at IS NULL THEN 1 ELSE 0 END) as active_count
-    FROM users u
-    LEFT JOIN tenants t ON t.telegram_user_id = u.telegram_user_id
-    GROUP BY u.telegram_user_id
-    ORDER BY u.created_at DESC
-  `).all();
-  res.json({ ok: true, count: rows.length, users: rows });
-});
-
-// GET /api/tenants — all tenants with docker status
-app.get('/api/tenants', (_req, res) => {
-  const tenants = db.prepare(`
-    SELECT t.*, u.created_at as user_created_at
-    FROM tenants t
-    LEFT JOIN users u ON u.telegram_user_id = t.telegram_user_id
-    ORDER BY t.created_at DESC
-  `).all();
-
-  const dockerStats = getDockerStats();
-
-  const enriched = tenants.map((t: any) => ({
-    ...t,
-    docker: dockerStats[`hfsp_${t.tenant_id}`] ?? { running: false },
-  }));
-
-  res.json({ ok: true, count: enriched.length, tenants: enriched });
-});
-
-// GET /api/tenants/:id — single tenant detail
-app.get('/api/tenants/:id', (req, res) => {
-  const row = db.prepare(`SELECT * FROM tenants WHERE tenant_id = ?`).get(req.params.id) as any;
-  if (!row) { res.status(404).json({ ok: false, error: 'not found' }); return; }
-
-  const dockerStats = getDockerStats();
-  res.json({ ok: true, tenant: { ...row, docker: dockerStats[`hfsp_${row.tenant_id}`] ?? { running: false } } });
-});
-
-// POST /api/tenants/:id/stop — force-stop container
-app.post('/api/tenants/:id/stop', (req, res) => {
-  const name = `hfsp_${req.params.id}`;
+// GET /admin/api/tenants
+app.get('/admin/api/tenants', requireAuth, (_req: AuthenticatedRequest, res: Response) => {
   try {
-    execSync(`docker stop ${name} 2>/dev/null || true`);
-    db.prepare(`UPDATE tenants SET status='stopped' WHERE tenant_id = ?`).run(req.params.id);
-    res.json({ ok: true, message: `${name} stopped` });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: String(e) });
+    const { status, search } = _req.query as { status?: string; search?: string };
+
+    let query = 'SELECT * FROM tenants WHERE 1=1';
+    const params: unknown[] = [];
+
+    if (status) {
+      query += ' AND status = ?';
+      params.push(status);
+    }
+    if (search) {
+      query += ' AND (id LIKE ? OR email LIKE ? OR subdomain LIKE ?)';
+      const like = `%${search}%`;
+      params.push(like, like, like);
+    }
+
+    query += ' ORDER BY created_at DESC';
+
+    const tenants = db.prepare(query).all(...params);
+    const dockerStats = getDockerStats();
+    const statsMap = new Map(dockerStats.map((s) => [s.name, s]));
+
+    const enriched = (tenants as Array<Record<string, unknown>>).map((t) => ({
+      ...t,
+      dockerStats: statsMap.get(`hfsp_${t['tenant_id']}`) ?? null,
+    }));
+
+    res.json({ ok: true, data: enriched });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: String(err) });
   }
 });
 
-// POST /api/tenants/:id/start — restart stopped container
-app.post('/api/tenants/:id/start', (req, res) => {
-  const name = `hfsp_${req.params.id}`;
+// GET /admin/api/tenants/:id
+app.get('/admin/api/tenants/:id', requireAuth, (req: AuthenticatedRequest, res: Response) => {
   try {
-    execSync(`docker start ${name} 2>/dev/null`);
-    db.prepare(`UPDATE tenants SET status='active' WHERE tenant_id = ?`).run(req.params.id);
-    res.json({ ok: true, message: `${name} started` });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: String(e) });
+    const tenant = db.prepare('SELECT * FROM tenants WHERE tenant_id = ?').get(req.params.id);
+    if (!tenant) {
+      res.status(404).json({ ok: false, error: 'Tenant not found' });
+      return;
+    }
+    res.json({ ok: true, data: tenant });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: String(err) });
   }
 });
 
-// DELETE /api/tenants/:id — force-remove container + mark deleted
-app.delete('/api/tenants/:id', (req, res) => {
-  const name = `hfsp_${req.params.id}`;
+// POST /admin/api/tenants/:id/stop
+app.post(
+  '/admin/api/tenants/:id/stop',
+  requireAuth,
+  requireRole('admin', 'owner'),
+  (req: AuthenticatedRequest, res: Response) => {
+    const id = String(req.params.id);
+    try {
+      execSync(`docker stop hfsp_${id} 2>/dev/null || true`, { timeout: 30000 });
+      db.prepare("UPDATE tenants SET status = 'stopped' WHERE tenant_id = ?").run(id);
+      audit(req, 'tenant.stop', 'tenant', id);
+      res.json({ ok: true });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: String(err) });
+    }
+  }
+);
+
+// POST /admin/api/tenants/:id/start
+app.post(
+  '/admin/api/tenants/:id/start',
+  requireAuth,
+  requireRole('admin', 'owner'),
+  (req: AuthenticatedRequest, res: Response) => {
+    const id = String(req.params.id);
+    try {
+      execSync(`docker start hfsp_${id} 2>/dev/null || true`, { timeout: 30000 });
+      db.prepare("UPDATE tenants SET status = 'active' WHERE tenant_id = ?").run(id);
+      audit(req, 'tenant.start', 'tenant', id);
+      res.json({ ok: true });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: String(err) });
+    }
+  }
+);
+
+// DELETE /admin/api/tenants/:id
+app.delete(
+  '/admin/api/tenants/:id',
+  requireAuth,
+  requireRole('owner'),
+  (req: AuthenticatedRequest, res: Response) => {
+    const id = String(req.params.id);
+    try {
+      // Remove docker container
+      try {
+        execSync(`docker rm -f hfsp_${id} 2>/dev/null || true`, {
+          timeout: 30000,
+        });
+      } catch {
+        // continue even if container doesn't exist
+      }
+
+      // Remove nginx config
+      const nginxConfPaths = [
+        `/etc/nginx/conf.d/hfsp-tenants/${id}.conf`,
+      ];
+      for (const confPath of nginxConfPaths) {
+        try {
+          fs.unlinkSync(confPath);
+        } catch {
+          // ignore missing files
+        }
+      }
+
+      // Reload nginx
+      try {
+        execSync('nginx -s reload 2>/dev/null || systemctl reload nginx 2>/dev/null || true', {
+          timeout: 10000,
+        });
+      } catch {
+        // ignore
+      }
+
+      // Remove from DB
+      db.prepare('DELETE FROM tenants WHERE tenant_id = ?').run(id);
+
+      audit(req, 'tenant.delete', 'tenant', id);
+      res.json({ ok: true });
+    } catch (err) {
+      res.status(500).json({ ok: false, error: String(err) });
+    }
+  }
+);
+
+// GET /admin/api/users
+app.get('/admin/api/users', requireAuth, (_req: AuthenticatedRequest, res: Response) => {
   try {
-    execSync(`docker rm -f ${name} 2>/dev/null || true`);
-    db.prepare(`UPDATE tenants SET status='deleted', deleted_at=datetime('now') WHERE tenant_id = ?`).run(req.params.id);
-    // Remove nginx conf if present
-    const confPath = `/etc/nginx/conf.d/hfsp-tenants/${req.params.id}.conf`;
-    execSync(`rm -f ${confPath} && sudo nginx -s reload 2>/dev/null || true`);
-    res.json({ ok: true, message: `${name} removed` });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: String(e) });
+    const { search } = _req.query as { search?: string };
+
+    let query = 'SELECT * FROM users WHERE 1=1';
+    const params: unknown[] = [];
+
+    if (search) {
+      query += ' AND (id LIKE ? OR email LIKE ?)';
+      const like = `%${search}%`;
+      params.push(like, like);
+    }
+
+    query += ' ORDER BY created_at DESC';
+
+    const users = db.prepare(query).all(...params);
+    res.json({ ok: true, data: users });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: String(err) });
   }
 });
 
-// GET / — HTML dashboard
-app.get('/', (_req, res) => {
-  res.setHeader('Content-Type', 'text/html');
-  res.send(DASHBOARD_HTML);
+// GET /admin/api/billing
+app.get('/admin/api/billing', requireAuth, (_req: AuthenticatedRequest, res: Response) => {
+  try {
+    const subscriptions = db.prepare(`
+      SELECT s.*, p.name as plan_name, p.price_usd, p.billing
+      FROM subscriptions s
+      LEFT JOIN plans p ON p.id = s.plan_id
+      ORDER BY s.created_at DESC
+    `).all();
+
+    const invoices = db.prepare(`
+      SELECT * FROM invoices ORDER BY created_at DESC LIMIT 200
+    `).all();
+
+    const { mrr, arr } = calcMrrArr();
+
+    res.json({ ok: true, data: { subscriptions, invoices, mrr, arr } });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: String(err) });
+  }
 });
 
-// ── HTML Dashboard ─────────────────────────────────────────────────────────
-const DASHBOARD_HTML = `<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>HFSP Admin Dashboard</title>
-<style>
-  * { box-sizing: border-box; margin: 0; padding: 0; }
-  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #0f0f13; color: #e2e8f0; min-height: 100vh; }
-  header { background: #1a1a2e; border-bottom: 1px solid #2d2d44; padding: 16px 24px; display: flex; align-items: center; gap: 12px; }
-  header h1 { font-size: 18px; font-weight: 600; color: #a78bfa; }
-  header .subtitle { font-size: 13px; color: #64748b; }
-  .container { max-width: 1200px; margin: 0 auto; padding: 24px; }
-  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px; margin-bottom: 32px; }
-  .card { background: #1a1a2e; border: 1px solid #2d2d44; border-radius: 10px; padding: 18px; }
-  .card-label { font-size: 11px; text-transform: uppercase; letter-spacing: .08em; color: #64748b; margin-bottom: 8px; }
-  .card-value { font-size: 28px; font-weight: 700; color: #e2e8f0; }
-  .card-sub { font-size: 12px; color: #64748b; margin-top: 4px; }
-  .bar-bg { background: #2d2d44; border-radius: 4px; height: 6px; margin-top: 10px; overflow: hidden; }
-  .bar-fill { height: 100%; border-radius: 4px; transition: width .3s; }
-  .bar-ok { background: #34d399; }
-  .bar-warn { background: #fbbf24; }
-  .bar-crit { background: #f87171; }
-  table { width: 100%; border-collapse: collapse; font-size: 13px; }
-  thead th { text-align: left; padding: 10px 12px; color: #64748b; font-weight: 500; border-bottom: 1px solid #2d2d44; }
-  tbody tr { border-bottom: 1px solid #1e1e30; transition: background .15s; }
-  tbody tr:hover { background: #1e1e30; }
-  tbody td { padding: 10px 12px; }
-  .badge { display: inline-block; padding: 2px 8px; border-radius: 12px; font-size: 11px; font-weight: 600; }
-  .badge-active { background: #064e3b; color: #34d399; }
-  .badge-stopped { background: #1c1917; color: #78716c; }
-  .badge-failed { background: #450a0a; color: #f87171; }
-  .badge-provisioning { background: #1e3a5f; color: #60a5fa; }
-  .badge-deleted { background: #1c1917; color: #44403c; }
-  .badge-running { background: #064e3b; color: #34d399; }
-  .badge-down { background: #450a0a; color: #f87171; }
-  .action-btn { background: #2d2d44; border: none; color: #e2e8f0; padding: 4px 10px; border-radius: 6px; cursor: pointer; font-size: 12px; margin-right: 4px; }
-  .action-btn:hover { background: #3d3d5c; }
-  .action-btn.danger { color: #f87171; }
-  .section-title { font-size: 14px; font-weight: 600; color: #a78bfa; margin-bottom: 12px; text-transform: uppercase; letter-spacing: .05em; }
-  .section { background: #1a1a2e; border: 1px solid #2d2d44; border-radius: 10px; padding: 20px; margin-bottom: 24px; }
-  .refresh-btn { background: #7c3aed; border: none; color: white; padding: 8px 16px; border-radius: 6px; cursor: pointer; font-size: 13px; margin-left: auto; display: block; margin-bottom: 16px; }
-  .refresh-btn:hover { background: #6d28d9; }
-  #last-updated { font-size: 11px; color: #64748b; text-align: right; margin-bottom: 8px; }
-  .monospace { font-family: 'SF Mono', monospace; font-size: 11px; color: #94a3b8; }
-</style>
-</head>
-<body>
-<header>
-  <div>
-    <h1>⚡ HFSP Admin</h1>
-    <div class="subtitle">Control Plane Dashboard</div>
-  </div>
-</header>
-<div class="container">
-  <button class="refresh-btn" onclick="loadAll()">↻ Refresh</button>
-  <div id="last-updated"></div>
+// GET /admin/api/audit-logs
+app.get('/admin/api/audit-logs', requireAuth, (_req: AuthenticatedRequest, res: Response) => {
+  try {
+    const limit  = Math.min(parseInt(String(_req.query.limit  ?? '50'),  10), 500);
+    const offset = parseInt(String(_req.query.offset ?? '0'),  10);
+    const search = _req.query.search as string | undefined;
 
-  <!-- VPS Capacity -->
-  <div id="vps-section" class="grid"></div>
+    let query = 'SELECT * FROM audit_logs WHERE 1=1';
+    const params: unknown[] = [];
 
-  <!-- Tenants -->
-  <div class="section">
-    <div class="section-title">Agents / Tenants</div>
-    <div id="tenants-table"><div style="color:#64748b;font-size:13px">Loading…</div></div>
-  </div>
+    if (search) {
+      query += ' AND (action LIKE ? OR actor_email LIKE ? OR target_type LIKE ? OR target_id LIKE ?)';
+      const like = `%${search}%`;
+      params.push(like, like, like, like);
+    }
 
-  <!-- Users -->
-  <div class="section">
-    <div class="section-title">Users</div>
-    <div id="users-table"><div style="color:#64748b;font-size:13px">Loading…</div></div>
-  </div>
-</div>
+    const total = (
+      db.prepare(`SELECT COUNT(*) as cnt FROM audit_logs WHERE 1=1${search ? ' AND (action LIKE ? OR actor_email LIKE ? OR target_type LIKE ? OR target_id LIKE ?)' : ''}`).get(
+        ...(search ? [`%${search}%`, `%${search}%`, `%${search}%`, `%${search}%`] : [])
+      ) as { cnt: number }
+    ).cnt;
 
-<script>
-const TOKEN = new URLSearchParams(location.search).get('token') || '';
+    query += ' ORDER BY id DESC LIMIT ? OFFSET ?';
+    params.push(limit, offset);
 
-async function api(path, opts={}) {
-  const r = await fetch(path + (path.includes('?') ? '&' : '?') + 'token=' + TOKEN, opts);
-  return r.json();
-}
+    const logs = db.prepare(query).all(...params);
 
-function barClass(pct) {
-  if (pct >= 80) return 'bar-crit';
-  if (pct >= 60) return 'bar-warn';
-  return 'bar-ok';
-}
+    res.json({ ok: true, data: { logs, total, limit, offset } });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: String(err) });
+  }
+});
 
-async function loadVps() {
-  const d = await api('/api/vps');
-  if (!d.ok) return;
-  const v = d.vps;
-  const metrics = [
-    { label: 'Memory Used', value: v.memory.usedPct + '%', sub: v.memory.availMb + ' MB free', pct: v.memory.usedPct },
-    { label: 'Disk Used', value: v.disk.usedPct + '%', sub: v.disk.availGb + ' GB free', pct: v.disk.usedPct },
-    { label: 'Ports Used', value: v.ports.usedPct + '%', sub: v.ports.used + ' / ' + v.ports.total + ' slots', pct: v.ports.usedPct },
-    { label: 'Hostname', value: v.hostname, sub: 'PIERCALITO', pct: null },
-  ];
-  document.getElementById('vps-section').innerHTML = metrics.map(m => \`
-    <div class="card">
-      <div class="card-label">\${m.label}</div>
-      <div class="card-value">\${m.value}</div>
-      <div class="card-sub">\${m.sub}</div>
-      \${m.pct !== null ? \`<div class="bar-bg"><div class="bar-fill \${barClass(m.pct)}" style="width:\${m.pct}%"></div></div>\` : ''}
-    </div>
-  \`).join('');
-}
+// GET /admin — serve SPA root
+app.get('/admin', (_req: Request, res: Response) => {
+  const spa = path.join(__dirname, '../public/index.html');
+  res.sendFile(spa);
+});
 
-async function loadTenants() {
-  const d = await api('/api/tenants');
-  if (!d.ok) { document.getElementById('tenants-table').innerHTML = '<span style="color:#f87171">Error loading</span>'; return; }
-  const rows = d.tenants.map(t => \`
-    <tr>
-      <td class="monospace">\${t.tenant_id}</td>
-      <td>\${t.agent_name ?? '—'}</td>
-      <td>\${t.telegram_user_id ?? '—'}</td>
-      <td><span class="badge badge-\${t.status}">\${t.status}</span></td>
-      <td><span class="badge \${t.docker.running ? 'badge-running' : 'badge-down'}">\${t.docker.running ? '▶ running' : '■ down'}</span></td>
-      <td>\${t.docker.cpuPct != null ? t.docker.cpuPct.toFixed(1) + '%' : '—'}</td>
-      <td>\${t.docker.memMb != null ? t.docker.memMb.toFixed(0) + ' MB' : '—'}</td>
-      <td class="monospace">\${(t.created_at ?? '').slice(0,16)}</td>
-      <td>
-        \${t.status !== 'deleted' ? \`
-          \${t.docker.running
-            ? \`<button class="action-btn" onclick="action('stop','\${t.tenant_id}')">Stop</button>\`
-            : \`<button class="action-btn" onclick="action('start','\${t.tenant_id}')">Start</button>\`}
-          <button class="action-btn danger" onclick="action('delete','\${t.tenant_id}')">Delete</button>
-        \` : '—'}
-      </td>
-    </tr>
-  \`).join('');
-  document.getElementById('tenants-table').innerHTML = \`
-    <table>
-      <thead><tr>
-        <th>Tenant ID</th><th>Agent Name</th><th>User</th>
-        <th>Status</th><th>Container</th><th>CPU</th><th>Mem</th>
-        <th>Created</th><th>Actions</th>
-      </tr></thead>
-      <tbody>\${rows || '<tr><td colspan="9" style="color:#64748b;text-align:center;padding:20px">No tenants</td></tr>'}</tbody>
-    </table>
-    <div style="margin-top:8px;font-size:12px;color:#64748b">\${d.count} total</div>
-  \`;
-}
+// GET /admin/* — catch-all SPA fallback
+app.get('/admin/{*path}', (_req: Request, res: Response) => {
+  const spa = path.join(__dirname, '../public/index.html');
+  res.sendFile(spa);
+});
 
-async function loadUsers() {
-  const d = await api('/api/users');
-  if (!d.ok) return;
-  const rows = d.users.map(u => \`
-    <tr>
-      <td class="monospace">\${u.telegram_user_id}</td>
-      <td>\${u.tenant_count}</td>
-      <td>\${u.active_count}</td>
-      <td class="monospace">\${(u.created_at ?? '').slice(0,16)}</td>
-    </tr>
-  \`).join('');
-  document.getElementById('users-table').innerHTML = \`
-    <table>
-      <thead><tr><th>Telegram User ID</th><th>Total Agents</th><th>Active</th><th>Joined</th></tr></thead>
-      <tbody>\${rows || '<tr><td colspan="4" style="color:#64748b;text-align:center;padding:20px">No users</td></tr>'}</tbody>
-    </table>
-    <div style="margin-top:8px;font-size:12px;color:#64748b">\${d.count} users</div>
-  \`;
-}
+// ---------------------------------------------------------------------------
+// Start server
+// ---------------------------------------------------------------------------
 
-async function action(type, tenantId) {
-  if (type === 'delete' && !confirm('Delete tenant ' + tenantId + '? This removes the container.')) return;
-  const method = type === 'delete' ? 'DELETE' : 'POST';
-  const url = '/api/tenants/' + tenantId + (type === 'delete' ? '' : '/' + type);
-  const r = await api(url, { method });
-  if (r.ok) loadAll();
-  else alert('Error: ' + r.error);
-}
-
-async function loadAll() {
-  await Promise.all([loadVps(), loadTenants(), loadUsers()]);
-  document.getElementById('last-updated').textContent = 'Updated: ' + new Date().toLocaleTimeString();
-}
-
-loadAll();
-setInterval(loadAll, 30000);
-</script>
-</body>
-</html>`;
+const PORT = parseInt(process.env.ADMIN_PORT ?? '3002', 10);
 
 app.listen(PORT, '127.0.0.1', () => {
-  console.log(`[admin] Dashboard running on http://127.0.0.1:${PORT}`);
-  console.log(`[admin] Token: ${ADMIN_TOKEN === 'changeme' ? '⚠ WARNING: using default token' : '(from secrets file)'}`);
+  console.log(`[admin-dashboard] Listening on http://127.0.0.1:${PORT}/admin`);
 });
+
+export default app;
