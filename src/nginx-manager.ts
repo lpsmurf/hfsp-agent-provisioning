@@ -55,6 +55,15 @@ location /ws/${safeId}/ {
     return join(this.tenantsDir, `${safeId}.conf`);
   }
 
+  /** Route a tenant on a REMOTE node through PIERCALITO nginx */
+  async addRemoteTenant(tenantId: string, remoteHost: string, port: number): Promise<void> {
+    const safeId = tenantId.replace(/[^a-zA-Z0-9_-]/g, '_');
+    const conf = `# Remote tenant: ${tenantId} on ${remoteHost}\nlocation /ws/${safeId}/ {\n    proxy_pass http://${remoteHost}:${port}/;\n    proxy_http_version 1.1;\n    proxy_set_header Upgrade $http_upgrade;\n    proxy_set_header Connection "upgrade";\n    proxy_set_header Host $host;\n    proxy_read_timeout 3600s;\n    proxy_send_timeout 3600s;\n}\n`;
+    const { writeFileSync } = require('fs');
+    writeFileSync(this.confPath(tenantId), conf, 'utf8');
+    await this.reload();
+  }
+
   private reload(): Promise<void> {
     return new Promise((resolve, reject) => {
       execFile("sudo", ["nginx", "-s", "reload"], (err, _stdout, stderr) => {
