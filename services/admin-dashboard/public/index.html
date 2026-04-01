@@ -1,0 +1,685 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>HFSP Admin Dashboard</title>
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+      background: #0f172a;
+      color: #e2e8f0;
+      line-height: 1.5;
+    }
+
+    .container {
+      max-width: 1400px;
+      margin: 0 auto;
+      padding: 20px;
+    }
+
+    header {
+      border-bottom: 1px solid #334155;
+      padding-bottom: 20px;
+      margin-bottom: 30px;
+    }
+
+    h1 {
+      font-size: 2em;
+      margin-bottom: 10px;
+    }
+
+    h2 {
+      font-size: 1.5em;
+      margin: 30px 0 15px 0;
+      border-top: 1px solid #334155;
+      padding-top: 20px;
+    }
+
+    .metrics {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+      gap: 20px;
+      margin: 20px 0;
+    }
+
+    .metric-card {
+      background: #1e293b;
+      border: 1px solid #334155;
+      border-radius: 8px;
+      padding: 20px;
+      text-align: center;
+    }
+
+    .metric-value {
+      font-size: 2.5em;
+      font-weight: bold;
+      color: #60a5fa;
+      margin: 10px 0;
+    }
+
+    .metric-label {
+      font-size: 0.9em;
+      color: #94a3b8;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+
+    .tabs {
+      display: flex;
+      gap: 10px;
+      border-bottom: 1px solid #334155;
+      margin-bottom: 20px;
+    }
+
+    .tab-btn {
+      padding: 12px 20px;
+      background: none;
+      border: none;
+      border-bottom: 2px solid transparent;
+      color: #94a3b8;
+      cursor: pointer;
+      transition: all 0.3s;
+      font-size: 1em;
+    }
+
+    .tab-btn:hover {
+      color: #cbd5e1;
+    }
+
+    .tab-btn.active {
+      color: #60a5fa;
+      border-bottom-color: #60a5fa;
+    }
+
+    .tab-content {
+      display: none;
+    }
+
+    .tab-content.active {
+      display: block;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 20px;
+    }
+
+    thead {
+      background: #1e293b;
+      border: 1px solid #334155;
+    }
+
+    th {
+      padding: 12px;
+      text-align: left;
+      font-weight: 600;
+      color: #cbd5e1;
+      border-bottom: 1px solid #334155;
+    }
+
+    td {
+      padding: 12px;
+      border-bottom: 1px solid #334155;
+    }
+
+    tr:hover {
+      background: #1e293b;
+    }
+
+    .status-badge {
+      display: inline-block;
+      padding: 4px 12px;
+      border-radius: 20px;
+      font-size: 0.85em;
+      font-weight: 600;
+    }
+
+    .status-active {
+      background: #10b981;
+      color: #ecfdf5;
+    }
+
+    .status-provisioning {
+      background: #f59e0b;
+      color: #fffbeb;
+    }
+
+    .status-failed {
+      background: #ef4444;
+      color: #fef2f2;
+    }
+
+    .status-deleted {
+      background: #6b7280;
+      color: #f9fafb;
+    }
+
+    .bar {
+      background: #334155;
+      border-radius: 4px;
+      height: 24px;
+      overflow: hidden;
+      margin: 8px 0;
+    }
+
+    .bar-fill {
+      height: 100%;
+      background: linear-gradient(90deg, #60a5fa, #3b82f6);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: white;
+      font-size: 0.75em;
+      font-weight: 600;
+    }
+
+    .button {
+      padding: 8px 16px;
+      background: #3b82f6;
+      color: white;
+      border: none;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 0.9em;
+      transition: background 0.3s;
+    }
+
+    .button:hover {
+      background: #2563eb;
+    }
+
+    .button.danger {
+      background: #ef4444;
+    }
+
+    .button.danger:hover {
+      background: #dc2626;
+    }
+
+    .loading {
+      text-align: center;
+      padding: 40px;
+      color: #94a3b8;
+    }
+
+    .error {
+      background: #7f1d1d;
+      color: #fecaca;
+      padding: 12px;
+      border-radius: 4px;
+      margin: 10px 0;
+    }
+
+    .empty {
+      text-align: center;
+      padding: 40px;
+      color: #64748b;
+    }
+
+    .search-box {
+      margin-bottom: 20px;
+    }
+
+    input[type="text"],
+    select {
+      padding: 10px;
+      background: #1e293b;
+      border: 1px solid #334155;
+      border-radius: 4px;
+      color: #e2e8f0;
+      font-size: 1em;
+    }
+
+    input[type="text"]:focus,
+    select:focus {
+      outline: none;
+      border-color: #60a5fa;
+      box-shadow: 0 0 0 2px rgba(96, 165, 250, 0.1);
+    }
+
+    .pagination {
+      display: flex;
+      gap: 10px;
+      margin-top: 20px;
+      justify-content: center;
+    }
+
+    .pagination button {
+      padding: 8px 12px;
+      background: #1e293b;
+      border: 1px solid #334155;
+      color: #cbd5e1;
+      cursor: pointer;
+      border-radius: 4px;
+      transition: all 0.3s;
+    }
+
+    .pagination button:hover {
+      background: #334155;
+    }
+
+    .pagination button.active {
+      background: #60a5fa;
+      border-color: #60a5fa;
+      color: white;
+    }
+
+    .spinner {
+      display: inline-block;
+      width: 20px;
+      height: 20px;
+      border: 2px solid #334155;
+      border-top-color: #60a5fa;
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+    }
+
+    @keyframes spin {
+      to { transform: rotate(360deg); }
+    }
+
+    .api-status {
+      padding: 10px;
+      background: #1e293b;
+      border-radius: 4px;
+      font-size: 0.9em;
+      margin-top: 20px;
+    }
+
+    .api-status.connected {
+      border-left: 3px solid #10b981;
+    }
+
+    .api-status.error {
+      border-left: 3px solid #ef4444;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <!-- HEADER -->
+    <header>
+      <h1>🚀 HFSP Admin Dashboard</h1>
+      <p>Manage tenants, users, billing, and VPS infrastructure</p>
+      <div id="apiStatus" class="api-status error">
+        <span class="spinner"></span> Connecting to API...
+      </div>
+    </header>
+
+    <!-- METRICS SECTION -->
+    <h2>Overview</h2>
+    <div class="metrics" id="metricsContainer">
+      <div class="metric-card">
+        <div class="metric-label">Total Tenants</div>
+        <div class="metric-value" id="totalTenants">-</div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-label">Active Tenants</div>
+        <div class="metric-value" id="activeTenants">-</div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-label">Provisioning</div>
+        <div class="metric-value" id="provisioningTenants">-</div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-label">Total Users</div>
+        <div class="metric-value" id="totalUsers">-</div>
+      </div>
+    </div>
+
+    <!-- CLUSTER CAPACITY -->
+    <h2>Cluster Capacity</h2>
+    <div class="metrics" id="capacityContainer">
+      <div class="metric-card">
+        <div class="metric-label">Total Capacity</div>
+        <div class="metric-value" id="totalCapacity">-</div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-label">Used</div>
+        <div class="metric-value" id="usedCapacity">-</div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-label">Available</div>
+        <div class="metric-value" id="availableCapacity">-</div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-label">Utilization</div>
+        <div class="metric-value" id="utilizationPercent">-</div>
+      </div>
+    </div>
+
+    <!-- TABS -->
+    <div class="tabs">
+      <button class="tab-btn active" onclick="switchTab('tenants')">📦 Tenants</button>
+      <button class="tab-btn" onclick="switchTab('users')">👥 Users</button>
+      <button class="tab-btn" onclick="switchTab('billing')">💰 Billing</button>
+      <button class="tab-btn" onclick="switchTab('vps')">🖥️ VPS Nodes</button>
+      <button class="tab-btn" onclick="switchTab('audit')">📋 Audit Logs</button>
+    </div>
+
+    <!-- TENANTS TAB -->
+    <div id="tenants" class="tab-content active">
+      <h2>Tenants</h2>
+      <div class="search-box">
+        <input type="text" id="tenantSearch" placeholder="Search tenant ID or agent name..." onkeyup="loadTenants()">
+        <select id="statusFilter" onchange="loadTenants()">
+          <option value="">All Status</option>
+          <option value="active">Active</option>
+          <option value="provisioning">Provisioning</option>
+          <option value="failed">Failed</option>
+        </select>
+      </div>
+      <div id="tenantsContainer"></div>
+    </div>
+
+    <!-- USERS TAB -->
+    <div id="users" class="tab-content">
+      <h2>Users</h2>
+      <div id="usersContainer"></div>
+    </div>
+
+    <!-- BILLING TAB -->
+    <div id="billing" class="tab-content">
+      <h2>Billing & Subscriptions</h2>
+      <div id="billingContainer"></div>
+    </div>
+
+    <!-- VPS NODES TAB -->
+    <div id="vps" class="tab-content">
+      <h2>VPS Cluster</h2>
+      <div id="vpsContainer"></div>
+    </div>
+
+    <!-- AUDIT LOGS TAB -->
+    <div id="audit" class="tab-content">
+      <h2>Audit Logs</h2>
+      <div id="auditContainer"></div>
+    </div>
+  </div>
+
+  <script>
+    const API_BASE = 'http://localhost:4000/api';
+
+    // Initialize
+    document.addEventListener('DOMContentLoaded', () => {
+      loadMetrics();
+      loadCapacity();
+      loadTenants();
+      setInterval(loadMetrics, 30000); // Refresh every 30s
+      setInterval(loadCapacity, 30000);
+    });
+
+    // TAB SWITCHING
+    function switchTab(tabName) {
+      // Hide all tabs
+      document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
+      document.querySelectorAll('.tab-btn').forEach(el => el.classList.remove('active'));
+
+      // Show selected tab
+      document.getElementById(tabName).classList.add('active');
+      event.target.classList.add('active');
+
+      // Load data
+      if (tabName === 'tenants') loadTenants();
+      if (tabName === 'users') loadUsers();
+      if (tabName === 'billing') loadBilling();
+      if (tabName === 'vps') loadVpsNodes();
+      if (tabName === 'audit') loadAuditLogs();
+    }
+
+    // API CALLS
+    async function apiCall(endpoint, method = 'GET', body = null) {
+      try {
+        const options = {
+          method,
+          headers: { 'Content-Type': 'application/json' }
+        };
+        if (body) options.body = JSON.stringify(body);
+
+        const response = await fetch(`${API_BASE}${endpoint}`, options);
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+
+        updateApiStatus(true);
+        return await response.json();
+      } catch (err) {
+        console.error('API error:', err);
+        updateApiStatus(false);
+        return null;
+      }
+    }
+
+    function updateApiStatus(connected) {
+      const status = document.getElementById('apiStatus');
+      if (connected) {
+        status.className = 'api-status connected';
+        status.innerHTML = '✅ Connected to Admin API';
+      } else {
+        status.className = 'api-status error';
+        status.innerHTML = '❌ Failed to connect to Admin API';
+      }
+    }
+
+    // METRICS
+    async function loadMetrics() {
+      const data = await apiCall('/metrics');
+      if (data) {
+        document.getElementById('totalTenants').innerText = data.data.totalTenants || 0;
+        document.getElementById('activeTenants').innerText = data.data.activeTenants || 0;
+        document.getElementById('provisioningTenants').innerText = data.data.provisioningTenants || 0;
+        document.getElementById('totalUsers').innerText = data.data.totalUsers || 0;
+      }
+    }
+
+    // CAPACITY
+    async function loadCapacity() {
+      const data = await apiCall('/vps/capacity');
+      if (data) {
+        const cap = data.data;
+        document.getElementById('totalCapacity').innerText = cap.totalCapacity || 0;
+        document.getElementById('usedCapacity').innerText = cap.usedCapacity || 0;
+        document.getElementById('availableCapacity').innerText = cap.availableCapacity || 0;
+        document.getElementById('utilizationPercent').innerText = (cap.utilizationPercent || 0) + '%';
+      }
+    }
+
+    // TENANTS
+    async function loadTenants() {
+      const container = document.getElementById('tenantsContainer');
+      container.innerHTML = '<div class="loading"><span class="spinner"></span> Loading...</div>';
+
+      const statusFilter = document.getElementById('statusFilter')?.value || '';
+      const query = statusFilter ? `?status=${statusFilter}` : '';
+
+      const data = await apiCall(`/tenants${query}`);
+      if (!data || !data.data) {
+        container.innerHTML = '<div class="error">Failed to load tenants</div>';
+        return;
+      }
+
+      if (data.data.length === 0) {
+        container.innerHTML = '<div class="empty">No tenants found</div>';
+        return;
+      }
+
+      let html = '<table><thead><tr><th>Tenant ID</th><th>Agent Name</th><th>Provider</th><th>Status</th><th>Port</th><th>Created</th><th>Actions</th></tr></thead><tbody>';
+
+      data.data.forEach(t => {
+        const statusClass = `status-${t.status || 'unknown'}`;
+        const createdDate = new Date(t.created_at).toLocaleDateString();
+        html += `<tr>
+          <td><code>${t.tenant_id.substring(0, 12)}...</code></td>
+          <td>${t.agent_name || '-'}</td>
+          <td>${t.provider || '-'}</td>
+          <td><span class="status-badge ${statusClass}">${t.status || 'unknown'}</span></td>
+          <td>${t.dashboard_port || '-'}</td>
+          <td>${createdDate}</td>
+          <td>
+            <button class="button danger" onclick="deleteTenant('${t.tenant_id}')">Delete</button>
+          </td>
+        </tr>`;
+      });
+
+      html += '</tbody></table>';
+      container.innerHTML = html;
+    }
+
+    // USERS
+    async function loadUsers() {
+      const container = document.getElementById('usersContainer');
+      container.innerHTML = '<div class="loading"><span class="spinner"></span> Loading...</div>';
+
+      const data = await apiCall('/users');
+      if (!data || !data.data) {
+        container.innerHTML = '<div class="error">Failed to load users</div>';
+        return;
+      }
+
+      if (data.data.length === 0) {
+        container.innerHTML = '<div class="empty">No users found</div>';
+        return;
+      }
+
+      let html = '<table><thead><tr><th>User ID</th><th>Active Tenants</th><th>Total Tenants</th><th>Last Tenant</th></tr></thead><tbody>';
+
+      data.data.forEach(u => {
+        const lastTenant = new Date(u.last_tenant_created).toLocaleDateString();
+        html += `<tr>
+          <td><code>${u.telegram_user_id}</code></td>
+          <td>${u.active_tenants || 0}</td>
+          <td>${u.total_tenants || 0}</td>
+          <td>${lastTenant}</td>
+        </tr>`;
+      });
+
+      html += '</tbody></table>';
+      container.innerHTML = html;
+    }
+
+    // BILLING
+    async function loadBilling() {
+      const container = document.getElementById('billingContainer');
+      container.innerHTML = '<div class="loading"><span class="spinner"></span> Loading...</div>';
+
+      const data = await apiCall('/billing/usage');
+      if (!data) {
+        container.innerHTML = '<div class="error">Failed to load billing data</div>';
+        return;
+      }
+
+      const usage = data.data;
+      let html = '<h3>Usage by Provider</h3>';
+      for (const [provider, count] of Object.entries(usage.tenantsByProvider || {})) {
+        const percent = ((count as number / usage.totalTenants) * 100).toFixed(0);
+        html += `
+          <div>
+            <strong>${provider}:</strong> ${count} tenants
+            <div class="bar">
+              <div class="bar-fill" style="width: ${percent}%">${percent}%</div>
+            </div>
+          </div>
+        `;
+      }
+
+      html += '<h3 style="margin-top: 30px;">Status Breakdown</h3>';
+      for (const [status, count] of Object.entries(usage.tenantsByStatus || {})) {
+        const percent = ((count as number / usage.totalTenants) * 100).toFixed(0);
+        html += `
+          <div>
+            <strong>${status}:</strong> ${count} tenants
+            <div class="bar">
+              <div class="bar-fill" style="width: ${percent}%">${percent}%</div>
+            </div>
+          </div>
+        `;
+      }
+
+      container.innerHTML = html;
+    }
+
+    // VPS NODES
+    async function loadVpsNodes() {
+      const container = document.getElementById('vpsContainer');
+      container.innerHTML = '<div class="loading"><span class="spinner"></span> Loading...</div>';
+
+      const data = await apiCall('/vps/nodes');
+      if (!data || !data.data) {
+        container.innerHTML = '<div class="empty">No VPS nodes configured</div>';
+        return;
+      }
+
+      let html = '<table><thead><tr><th>Node ID</th><th>Host</th><th>Used / Total</th><th>Utilization</th><th>Status</th></tr></thead><tbody>';
+
+      data.data.forEach(n => {
+        const util = n.utilizationPercent || 0;
+        html += `<tr>
+          <td><strong>${n.id}</strong></td>
+          <td><code>${n.host}</code></td>
+          <td>${n.usedContainers} / ${n.max_containers}</td>
+          <td>
+            <div class="bar">
+              <div class="bar-fill" style="width: ${util}%">${util}%</div>
+            </div>
+          </td>
+          <td><span class="status-badge status-active">${n.status}</span></td>
+        </tr>`;
+      });
+
+      html += '</tbody></table>';
+      container.innerHTML = html;
+    }
+
+    // AUDIT LOGS
+    async function loadAuditLogs() {
+      const container = document.getElementById('auditContainer');
+      container.innerHTML = '<div class="loading"><span class="spinner"></span> Loading...</div>';
+
+      const data = await apiCall('/audit/logs?limit=50');
+      if (!data || !data.data) {
+        container.innerHTML = '<div class="empty">No audit logs</div>';
+        return;
+      }
+
+      if (data.data.length === 0) {
+        container.innerHTML = '<div class="empty">No audit logs found</div>';
+        return;
+      }
+
+      let html = '<table><thead><tr><th>Timestamp</th><th>Action</th><th>Resource</th><th>Details</th></tr></thead><tbody>';
+
+      data.data.forEach(log => {
+        const date = new Date(log.timestamp).toLocaleString();
+        html += `<tr>
+          <td><small>${date}</small></td>
+          <td><strong>${log.action}</strong></td>
+          <td><code>${log.resource_id}</code></td>
+          <td><small>${log.details}</small></td>
+        </tr>`;
+      });
+
+      html += '</tbody></table>';
+      container.innerHTML = html;
+    }
+
+    // ACTIONS
+    async function deleteTenant(tenantId) {
+      if (!confirm(`Delete tenant ${tenantId}? This cannot be undone.`)) return;
+
+      const result = await apiCall(`/tenants/${tenantId}`, 'DELETE');
+      if (result?.success) {
+        alert('Tenant deleted');
+        loadTenants();
+      } else {
+        alert('Failed to delete tenant');
+      }
+    }
+  </script>
+</body>
+</html>

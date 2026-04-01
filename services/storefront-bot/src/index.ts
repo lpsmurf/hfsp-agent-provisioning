@@ -121,7 +121,7 @@ function unprotectTenantRowTokens(row: any): any {
 
 // Tenant VPS provisioning (private-only)
 const TENANT_VPS_HOST = process.env.TENANT_VPS_HOST ?? '187.124.173.69';
-const TENANT_VPS_USER = process.env.TENANT_VPS_USER ?? 'root';
+const TENANT_VPS_USER = process.env.TENANT_VPS_USER ?? 'tenant';
 const TENANT_VPS_SSH_KEY = process.env.TENANT_VPS_SSH_KEY ?? '/home/clawd/.ssh/id_ed25519_hfsp_provisioner';
 const TENANT_VPS_BASEDIR = process.env.TENANT_VPS_BASEDIR ?? '/opt/hfsp/tenants';
 const TENANT_RUNTIME_IMAGE = process.env.TENANT_RUNTIME_IMAGE ?? 'hfsp/openclaw-runtime:stable';
@@ -2053,11 +2053,12 @@ app.post('/telegram/webhook', async (req, res) => {
   }
 });
 
-app.listen(PORT, '127.0.0.1', () => {
+const httpServer = app.listen(PORT, '127.0.0.1', () => {
   console.log(`Storefront bot webhook listening on http://127.0.0.1:${PORT}`);
   console.log(`DB: ${DB_PATH}`);
   // Configure the Mini App menu button on startup
   setupMenuButton().catch((e) => console.error('setupMenuButton error:', e));
+  attachWebSocketServer(httpServer);
   console.log(`Tenant VPS: ${TENANT_VPS_USER}@${TENANT_VPS_HOST} (key=${TENANT_VPS_SSH_KEY}) baseDir=${TENANT_VPS_BASEDIR}`);
   console.log(`Tenant runtime image: ${TENANT_RUNTIME_IMAGE}`);
 });
@@ -2208,3 +2209,305 @@ async function handleAppCommand(chatId: number) {
     },
   });
 }
+
+
+// ── POST /api/webapp/validate-bot (no auth — called before auth during wizard) ──
+app.post('/api/webapp/validate-bot', async (req, res) => {
+  const { botToken } = req.body ?? {};
+  if (!botToken || typeof botToken !== 'string') {
+    res.status(400).json({ ok: false, error: 'botToken required' });
+    return;
+  }
+  try {
+    const tgRes = await fetch(`https://api.telegram.org/bot${botToken.trim()}/getMe`);
+    const json = await tgRes.json() as any;
+    if (!json.ok) {
+      res.json({ ok: false, error: json.description ?? 'Invalid bot token' });
+      return;
+    }
+    res.json({ ok: true, username: json.result.username, firstName: json.result.first_name });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: 'Could not reach Telegram API' });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// WEBAPP AGENT ROUTES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Middleware: verify JWT from Authorization header, attach payload to req
+function requireWebAppAuth(req: any, res: any, next: any) {
+  const auth = req.headers.authorization ?? '';
+  const token = auth.startsWith('Bearer ') ? auth.slice(7) : '';
+  const payload = verifyToken(token);
+  if (!payload) {
+    res.status(401).json({ error: { code: 'UNAUTHORIZED', message: 'Invalid or expired token' } });
+    return;
+  }
+  req.webappUser = payload;
+  next();
+}
+
+// ── db migrations for webapp fields ─────────────────────────────────────────
+try { db.exec(`ALTER TABLE tenants ADD COLUMN api_key_enc TEXT`); } catch {}
+try { db.exec(`ALTER TABLE tenants ADD COLUMN webapp_created INTEGER NOT NULL DEFAULT 0`); } catch {}
+
+// ── WebSocket hub for provisioning events ───────────────────────────────────
+// Map agentId → Set of send functions
+const wsSubs = new Map<string, Set<(data: string) => void>>();
+
+function wsSend(agentId: string, event: object) {
+  const subs = wsSubs.get(agentId);
+  if (!subs) return;
+  const msg = JSON.stringify(event);
+  subs.forEach(send => { try { send(msg); } catch {} });
+}
+
+// Upgrade HTTP server to handle /ws WebSocket connections
+// This runs after app.listen so we attach to the server object below.
+function attachWebSocketServer(server: any) {
+  let WebSocketServer: any;
+  try { const wsModule = require('ws'); WebSocketServer = wsModule.WebSocketServer ?? wsModule.Server ?? wsModule.default?.Server; if (!WebSocketServer) return; } catch { return; }
+  const wss = new WebSocketServer({ noServer: true });
+  server.on('upgrade', (request: any, socket: any, head: any) => {
+    const url = new URL(request.url, `http://${request.headers.host}`);
+    if (url.pathname !== '/ws') { socket.destroy(); return; }
+    wss.handleUpgrade(request, socket, head, (ws: any) => {
+      const agentId = url.searchParams.get('agentId') ?? '';
+      if (!agentId) { ws.close(); return; }
+      if (!wsSubs.has(agentId)) wsSubs.set(agentId, new Set());
+      const send = (data: string) => ws.readyState === 1 && ws.send(data);
+      wsSubs.get(agentId)!.add(send);
+      ws.on('close', () => wsSubs.get(agentId)?.delete(send));
+    });
+  });
+}
+
+// ── Background provisioning ──────────────────────────────────────────────────
+async function runWebAppProvisioning(tenantId: string, payload: {
+  botToken: string; botUsername: string;
+  provider: string; apiKey: string; agentName: string;
+  telegramUserId: number;
+}) {
+  const emit = (step: string, status: 'active'|'done'|'failed', message = '') =>
+    wsSend(tenantId, { step, status, message });
+
+  try {
+    // Allocate port
+    function allocatePort(): number {
+      const used = new Set<number>(
+        (db.prepare("SELECT dashboard_port FROM tenants WHERE dashboard_port IS NOT NULL AND (status IS NULL OR status != 'deleted')").all() as any[])
+          .map((r: any) => Number(r.dashboard_port)).filter(Number.isFinite)
+      );
+      for (let i = 0; i < 2000; i++) {
+        const p = 19000 + Math.floor(Math.random() * 1000);
+        if (!used.has(p)) return p;
+      }
+      throw new Error('No free ports');
+    }
+
+    // ── step: validate ───────────────────────────────────────────────────────
+    emit('validate', 'active');
+    const tmRes = await fetch(`https://api.telegram.org/bot${payload.botToken}/getMe`);
+    const tmJson = await tmRes.json() as any;
+    if (!tmJson.ok) {
+      db.prepare(`UPDATE tenants SET status='failed' WHERE tenant_id=?`).run(tenantId);
+      emit('validate', 'failed', 'Invalid bot token');
+      return;
+    }
+    emit('validate', 'done');
+
+    // ── step: provision ──────────────────────────────────────────────────────
+    emit('provision', 'active');
+    const dashboardPort = allocatePort();
+    db.prepare(`UPDATE tenants SET dashboard_port=? WHERE tenant_id=?`).run(dashboardPort, tenantId);
+
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'hfsp-dash-'));
+    const keyBase = path.join(tmpDir, `hfsp_${tenantId}`);
+    execFileSync('ssh-keygen', ['-t', 'ed25519', '-C', tenantId, '-f', keyBase, '-N', ''], { stdio: 'ignore' });
+    const pub = fs.readFileSync(`${keyBase}.pub`, 'utf8').trim();
+    const out = sshTenant(`sudo /usr/local/bin/hfsp_dash_allow_key ${dashboardPort} ${shSingleQuote(pub)}`);
+    if (!out.includes('OK')) throw new Error(`Key install failed: ${out}`);
+
+    const tenantDir = `${TENANT_VPS_BASEDIR}/${tenantId}`;
+    sshTenant(`mkdir -p ${tenantDir}/workspace ${tenantDir}/secrets`);
+    emit('provision', 'done');
+
+    // ── step: configure ──────────────────────────────────────────────────────
+    emit('configure', 'active');
+    // Write secrets
+    sshTenant(`bash -lc 'echo ${shSingleQuote(Buffer.from(payload.botToken + '\n').toString('base64'))} | base64 -d > ${tenantDir}/secrets/telegram.token'`);
+    const providerKeyFile = payload.provider === 'openai' ? 'openai.key' : payload.provider === 'anthropic' ? 'anthropic.key' : 'openrouter.key';
+    sshTenant(`bash -lc 'echo ${shSingleQuote(Buffer.from(payload.apiKey + '\n').toString('base64'))} | base64 -d > ${tenantDir}/secrets/${providerKeyFile}'`);
+
+    // Write openclaw config
+    const gatewayToken = Buffer.from(`${tenantId}:${Math.random().toString(36).slice(2)}`).toString('hex').slice(0, 48);
+    db.prepare(`UPDATE tenants SET gateway_token=? WHERE tenant_id=?`).run(encryptString(gatewayToken), tenantId);
+    const cfg = {
+      agents: { defaults: { workspace: '/tenant/workspace' }, list: [{ id: 'main', default: true, name: payload.agentName, workspace: '/tenant/workspace', identity: { name: payload.agentName, emoji: '🤖' } }] },
+      gateway: { port: dashboardPort, bind: 'lan', mode: 'local', auth: { mode: 'token', token: gatewayToken }, controlUi: { enabled: true, allowedOrigins: [`http://localhost:${dashboardPort}`] } },
+      plugins: { entries: { telegram: { enabled: true } } },
+      channels: { telegram: { enabled: true, accounts: { default: { enabled: true, dmPolicy: 'pairing', groupPolicy: 'disabled', tokenFile: '/home/clawd/.openclaw/secrets/telegram.token', streaming: 'off' } } } },
+      bindings: [{ agentId: 'main', match: { channel: 'telegram', accountId: 'default' } }]
+    };
+    sshTenant(`bash -lc 'echo ${shSingleQuote(Buffer.from(JSON.stringify(cfg, null, 2)).toString('base64'))} | base64 -d > ${tenantDir}/openclaw.json'`);
+    emit('configure', 'done');
+
+    // ── step: start ──────────────────────────────────────────────────────────
+    emit('start', 'active');
+    const cname = `hfsp_${tenantId}`;
+    sshTenant(`docker rm -f ${cname} >/dev/null 2>&1 || true`);
+    sshTenant([
+      'docker run -d', `--name ${cname}`, '--restart unless-stopped',
+      `-p 127.0.0.1:${dashboardPort}:${dashboardPort}`,
+      `-v ${tenantDir}/workspace:/tenant/workspace`,
+      `-v ${tenantDir}/openclaw.json:/home/clawd/.openclaw/openclaw.json:ro`,
+      `-v ${tenantDir}/secrets:/home/clawd/.openclaw/secrets:ro`,
+      TENANT_RUNTIME_IMAGE
+    ].join(' '));
+    sshTenant(`docker exec -u root ${cname} bash -lc 'chown -R 10001:10001 /tenant/workspace || true'`);
+    emit('start', 'done');
+
+    // ── step: ready ──────────────────────────────────────────────────────────
+    emit('ready', 'active');
+    db.prepare(`UPDATE tenants SET status='pairing' WHERE tenant_id=?`).run(tenantId);
+    // Notify user via main bot
+    try {
+      await sendMessage(payload.telegramUserId, `✅ *${payload.agentName}* deployed!\n\nOpen @${payload.botUsername} → send /start → paste the pairing code in the app.`);
+    } catch {}
+    emit('ready', 'done');
+
+  } catch (err) {
+    console.error('[webapp provision error]', err);
+    db.prepare(`UPDATE tenants SET status='failed' WHERE tenant_id=?`).run(tenantId);
+    wsSend(tenantId, { step: 'provision', status: 'failed', message: (err as Error).message ?? 'Provisioning failed' });
+  }
+}
+
+// ── GET /api/webapp/agents ───────────────────────────────────────────────────
+app.get('/api/webapp/agents', requireWebAppAuth, (req: any, res) => {
+  const telegramId = Number(req.webappUser.telegram_id);
+  const rows = db.prepare(
+    `SELECT tenant_id, agent_name, bot_username, provider, status, created_at
+     FROM tenants
+     WHERE telegram_user_id=? AND deleted_at IS NULL
+     ORDER BY created_at DESC`
+  ).all(telegramId) as any[];
+
+  const agents = rows.map(r => ({
+    id: r.tenant_id,
+    name: r.agent_name ?? r.tenant_id,
+    botUsername: r.bot_username ?? '',
+    provider: r.provider ?? '',
+    status: r.status ?? 'active',
+    createdAt: r.created_at,
+  }));
+  res.json({ agents });
+});
+
+// ── POST /api/webapp/agents ──────────────────────────────────────────────────
+app.post('/api/webapp/agents', requireWebAppAuth, async (req: any, res) => {
+  const { botToken, botUsername, provider, apiKey, agentName } = req.body ?? {};
+  if (!botToken || !botUsername || !provider || !apiKey || !agentName) {
+    res.status(400).json({ error: { code: 'MISSING_FIELDS', message: 'All fields required' } });
+    return;
+  }
+  const validProviders = ['openai', 'anthropic', 'openrouter'];
+  if (!validProviders.includes(provider)) {
+    res.status(400).json({ error: { code: 'INVALID_PROVIDER', message: 'Invalid provider' } });
+    return;
+  }
+
+  const telegramId = Number(req.webappUser.telegram_id);
+  const tenantId = `t_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+
+  db.prepare(
+    `INSERT INTO tenants(tenant_id, telegram_user_id, agent_name, bot_username, provider, status, webapp_created, api_key_enc)
+     VALUES (?,?,?,?,?,'provisioning',1,?)`
+  ).run(tenantId, telegramId, agentName.trim(), botUsername.replace('@','').trim(), provider, encryptString(apiKey.trim()));
+
+  const agent = {
+    id: tenantId,
+    name: agentName.trim(),
+    botUsername: botUsername.replace('@','').trim(),
+    provider,
+    status: 'provisioning',
+    createdAt: new Date().toISOString(),
+  };
+
+  // Start provisioning in background
+  runWebAppProvisioning(tenantId, {
+    botToken: botToken.trim(),
+    botUsername: botUsername.replace('@','').trim(),
+    provider,
+    apiKey: apiKey.trim(),
+    agentName: agentName.trim(),
+    telegramUserId: telegramId,
+  }).catch(e => console.error('[webapp provision bg]', e));
+
+  res.json({ agent });
+});
+
+// ── POST /api/webapp/agents/:id/pair ────────────────────────────────────────
+app.post('/api/webapp/agents/:id/pair', requireWebAppAuth, async (req: any, res) => {
+  const telegramId = Number(req.webappUser.telegram_id);
+  const { id } = req.params;
+  const { code } = req.body ?? {};
+
+  if (!code) { res.status(400).json({ error: { code: 'MISSING_CODE', message: 'code required' } }); return; }
+
+  const row = db.prepare(`SELECT tenant_id, status FROM tenants WHERE tenant_id=? AND telegram_user_id=? AND deleted_at IS NULL`).get(id, telegramId) as any;
+  if (!row) { res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Agent not found' } }); return; }
+
+  const clean = code.trim().replace(/\s+/g,'').toUpperCase();
+  if (!/^[A-Z0-9-]{6,20}$/.test(clean)) {
+    res.status(400).json({ ok: false, error: 'Invalid pairing code format' });
+    return;
+  }
+
+  try {
+    const containerName = `hfsp_${id}`;
+    const approveInner = `HOME=/home/clawd openclaw pairing approve telegram ${clean}`;
+    const cmd = `docker exec -u clawd ${containerName} bash -lc ${shSingleQuote(approveInner)}`;
+    sshTenant(cmd);
+    db.prepare(`UPDATE tenants SET status='active' WHERE tenant_id=?`).run(id);
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(400).json({ ok: false, error: (err as Error).message ?? 'Pairing failed' });
+  }
+});
+
+// ── DELETE /api/webapp/agents/:id ───────────────────────────────────────────
+app.delete('/api/webapp/agents/:id', requireWebAppAuth, (req: any, res) => {
+  const telegramId = Number(req.webappUser.telegram_id);
+  const { id } = req.params;
+  const row = db.prepare(`SELECT tenant_id FROM tenants WHERE tenant_id=? AND telegram_user_id=? AND deleted_at IS NULL`).get(id, telegramId);
+  if (!row) { res.status(404).json({ error: 'Not found' }); return; }
+
+  // Stop container in background, mark deleted
+  try { sshTenant(`docker rm -f hfsp_${id} >/dev/null 2>&1 || true`); } catch {}
+  db.prepare(`UPDATE tenants SET deleted_at=datetime('now'), status='deleted' WHERE tenant_id=?`).run(id);
+  res.json({ ok: true });
+});
+
+// ── POST /api/webapp/agents/:id/restart ─────────────────────────────────────
+app.post('/api/webapp/agents/:id/restart', requireWebAppAuth, (req: any, res) => {
+  const telegramId = Number(req.webappUser.telegram_id);
+  const { id } = req.params;
+  const row = db.prepare(`SELECT tenant_id, status FROM tenants WHERE tenant_id=? AND telegram_user_id=? AND deleted_at IS NULL`).get(id, telegramId) as any;
+  if (!row) { res.status(404).json({ error: 'Not found' }); return; }
+
+  try {
+    // Try restart first; if container doesn't exist, try start; otherwise fail gracefully
+    const cname = `hfsp_${id}`;
+    try {
+      sshTenant(`docker restart ${cname}`);
+    } catch {
+      sshTenant(`docker start ${cname}`);
+    }
+    db.prepare(`UPDATE tenants SET status='active' WHERE tenant_id=?`).run(id);
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: (err as Error).message ?? 'Restart failed. Container may not exist — try deleting and redeploying.' });
+  }
+});
