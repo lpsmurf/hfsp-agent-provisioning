@@ -12,7 +12,7 @@
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
     "react-router-dom": "^6.20.0",
-    "axios": "^1.6.2",
+    "axios": "^1.15.0",
     "react-query": "^3.39.3",
     "react-hook-form": "^7.48.0",
     "zod": "^3.22.4",
@@ -20,7 +20,7 @@
   },
   "devDependencies": {
     "typescript": "^5.3.3",
-    "vite": "^4.5.1",
+    "vite": "^8.0.10",
     "@vitejs/plugin-react": "^4.2.1",
     "@types/react": "^18.2.37",
     "@types/react-dom": "^18.2.15",
